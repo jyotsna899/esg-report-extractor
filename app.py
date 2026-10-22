@@ -13,7 +13,11 @@ Run locally with:  streamlit run app.py
 import json
 import os
 import io
+import shutil
+import subprocess
+import sys
 import tempfile
+import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -40,14 +44,20 @@ except ImportError:
     FPDF_AVAILABLE = False
 
 from extractor import (
-    extract_text_from_pdf,
-    extract_esg_metrics,
     brsr_coverage_report,
     identify_red_flags,
-    find_brsr_start_page,
     answer_chat_question,
     generate_summary,
     BRSR_PRINCIPLES,
+)
+from store import (
+    data_dir,
+    job_input_dir,
+    load_job,
+    load_reports,
+    save_job,
+    save_pending_job,
+    save_reports,
 )
 
 st.set_page_config(page_title="ESG Report Extractor", layout="wide")
@@ -65,149 +75,360 @@ if not os.environ.get("GEMINI_API_KEY"):
 
 st.title("📊 AI-Powered ESG Extraction & Comparative Benchmarking Platform")
 st.caption(
-    "Upload a sustainability / ESG / BRSR report PDF. The tool reads it, "
-    "pulls out every quantifiable ESG metric, maps it to GRI codes and "
-    "BRSR Core principles, builds a topic index for fast follow-up "
-    "questions, and lets you compare companies side by side."
+    "Upload one or more sustainability / ESG / BRSR report PDFs. "
+    "The tool extracts quantifiable ESG metrics, maps them to GRI codes and "
+    "BRSR Core principles, compares the companies, and downloads CSV files."
 )
 
-st.session_state.setdefault("slot_a", None)  # {"name", "metrics", "topic_index", "page_map", "full_text", "chat_history"}
-st.session_state.setdefault("slot_b", None)
+def _stored_mtime():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "reports.json")
+    if not os.path.isfile(path):
+        return None
+    return os.path.getmtime(path)
 
 
-# ---------------------------------------------------------------------
-# Shared helper: runs the full upload -> detect -> extract pipeline for
-# one PDF, storing the result into a fixed slot ("slot_a" or "slot_b")
-# rather than an open-ended list — Tab 1 always owns slot_a, Tab 2 always
-# owns slot_b, and Compare just reads both directly. No separate upload
-# path in Compare anymore, since that was the confusing duplicate.
-# ---------------------------------------------------------------------
-def run_extraction_ui(key_prefix: str, slot_key: str):
-    company_name = st.text_input("Company name", value="", key=f"{key_prefix}_company")
+def _sync_reports():
+    mtime = _stored_mtime()
+    if st.session_state.get("_reports_mtime") != mtime or "reports" not in st.session_state:
+        st.session_state["reports"] = load_reports()
+        st.session_state["_reports_mtime"] = mtime
 
-    scan_whole_doc = st.checkbox(
-        "Scan the entire document instead of auto-detecting a section",
-        value=False,
-        key=f"{key_prefix}_scan_whole",
-        help=(
-            "More reliable when heading detection can't find the right "
-            "section (different wording, scanned pages, GRI-only reports) "
-            "— just slower and uses more API calls on long reports."
-        ),
+
+def _persist_reports(reports):
+    save_reports(reports)
+    st.session_state["reports"] = reports
+    st.session_state["_reports_mtime"] = _stored_mtime()
+
+
+_sync_reports()
+
+
+def _job_process_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _job_is_running(job):
+    if job.get("status") != "running":
+        return False
+    pid = job.get("pid")
+    if pid is None:
+        return True
+    if not _job_process_alive(pid):
+        save_job(status="failed", message="Background worker stopped before finishing.")
+        return False
+    return True
+
+
+def _spawn_background_extraction(items):
+    root = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(data_dir(), "job.log")
+    with open(log_path, "a", encoding="utf-8") as log_handle:
+        process = subprocess.Popen(
+            [sys.executable, os.path.join(root, "background_job.py")],
+            cwd=root,
+            start_new_session=True,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+    save_job(
+        status="running",
+        message="Starting background extraction...",
+        progress=0.0,
+        pid=process.pid,
+        ready_count=0,
+        total_count=len(items),
+        current_index=0,
+        error=None,
     )
-    start_page = st.number_input(
-        "Start page (skip to BRSR/ESG section)",
-        min_value=1,
-        value=st.session_state.get(f"{key_prefix}_detected_start_page", 1),
-        step=1,
-        key=f"{key_prefix}_start_page_input",
-        disabled=scan_whole_doc,
-    )
-    max_pages = st.slider(
-        "Pages to process from start page", 5, 400, 150,
-        key=f"{key_prefix}_max_pages", disabled=scan_whole_doc,
-    )
 
-    uploaded_file = st.file_uploader(
-        "Upload ESG/Sustainability/BRSR report (PDF)", type=["pdf"], key=f"{key_prefix}_uploader"
-    )
 
-    if not uploaded_file:
-        return
+@st.fragment(run_every=5)
+def _poll_background_job():
+    _sync_reports()
+    job = load_job()
+    if job.get("status") == "running" and _job_is_running(job):
+        st.info(
+            f"**Scan in progress** — {job.get('message', 'Working...')} "
+            "You can close this tab; extraction continues on this computer."
+        )
+        st.progress(float(job.get("progress") or 0.0))
 
-    detect_col, extract_col = st.columns([1, 1])
 
-    with detect_col:
-        if st.button("🔍 Auto-Find BRSR Section", key=f"{key_prefix}_autofind", disabled=scan_whole_doc):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded_file.getvalue())
-                tmp_path = tmp.name
+def _display_name_from_filename(filename: str) -> str:
+    stem = os.path.splitext(filename)[0].replace("_", " ").replace("-", " ")
+    return " ".join(stem.split()) or "Unknown"
 
-            progress_bar = st.progress(0, text="Scanning report for the BRSR section...")
 
-            def _update_progress(current, total):
-                progress_bar.progress(
-                    current / total,
-                    text=f"Scanning report for the BRSR section... (page {current}/{total})",
-                )
+def _unique_company_name(name: str, used: set[str]) -> str:
+    base = name.strip() or "Unknown"
+    candidate = base
+    n = 2
+    while candidate in used:
+        candidate = f"{base} ({n})"
+        n += 1
+    used.add(candidate)
+    return candidate
 
-            try:
-                detected = find_brsr_start_page(tmp_path, progress_callback=_update_progress)
-            except ValueError as e:
-                progress_bar.empty()
-                st.error(f"⚠️ {e}")
-                detected = None
-            else:
-                progress_bar.empty()
 
-            if detected:
-                st.session_state[f"{key_prefix}_detected_start_page"] = detected
-                st.success(f"Found it — BRSR section appears to start around page {detected}.")
-                st.rerun()
-            else:
-                st.warning(
-                    "Couldn't confidently detect a BRSR section heading. "
-                    "Try setting the start page manually, or check "
-                    "'Scan the entire document instead' above."
-                )
+def _safe_download_stem(name: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name).strip("_")
+    return cleaned or "report"
 
-    with extract_col:
-        run_extraction = st.button("Extract Metrics", type="primary", key=f"{key_prefix}_extract_btn")
 
-    if not run_extraction:
-        return
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_file.getvalue())
-        tmp_path = tmp.name
-
-    read_progress = st.progress(0, text="Reading PDF...")
-
-    def _read_progress(current, total):
-        read_progress.progress(current / total, text=f"Reading PDF... (page {current}/{total})")
-
-    if scan_whole_doc:
-        text = extract_text_from_pdf(tmp_path, max_pages=100_000, start_page=1, progress_callback=_read_progress)
-    else:
-        text = extract_text_from_pdf(tmp_path, max_pages=max_pages, start_page=start_page, progress_callback=_read_progress)
-    read_progress.empty()
-    st.info(f"Extracted {len(text):,} characters from the report.")
-
-    extract_progress = st.progress(0, text="Starting AI extraction...")
-
-    def _extract_progress(current, total, status_text):
-        extract_progress.progress(current / max(total, 1), text=status_text)
-
-    metrics, debug_log, topic_index, page_map = extract_esg_metrics(
-        text, company_name=company_name or "Unknown", progress_callback=_extract_progress
-    )
-    extract_progress.empty()
-
-    with st.expander("🔧 Extraction debug log (open this if results look wrong)", expanded=not metrics):
-        for entry in debug_log:
-            status = entry["status"]
-            icon = {"ok": "✅", "empty_response": "⚠️", "parse_error": "❌", "api_error": "🛑", "error": "🛑"}.get(status, "•")
-            st.write(f"{icon} Chunk {entry['chunk']} — **{status}**: {entry['detail']}")
-
+def _metrics_frame(metrics: list[dict]) -> pd.DataFrame:
     if not metrics:
-        st.warning(
-            "No structured metrics were found. Check the debug log above — "
-            "it will tell you whether this is a page-range problem, an "
-            "API/key problem, or genuinely nothing numeric in this text."
+        return pd.DataFrame()
+    return _safe_metrics_df(metrics)
+
+
+def _combined_metrics_csv(reports: list[dict]) -> str:
+    frames = [_metrics_frame(report["metrics"]) for report in reports if report.get("metrics")]
+    frames = [frame for frame in frames if not frame.empty]
+    if not frames:
+        return ""
+    return pd.concat(frames, ignore_index=True).to_csv(index=False)
+
+
+def _reports_csv_zip(reports: list[dict]) -> bytes:
+    buf = io.BytesIO()
+    used = set()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for report in reports:
+            if not report.get("metrics"):
+                continue
+            stem = _safe_download_stem(report["name"])
+            filename = f"{stem}.csv"
+            n = 2
+            while filename in used:
+                filename = f"{stem}_{n}.csv"
+                n += 1
+            used.add(filename)
+            archive.writestr(filename, _metrics_frame(report["metrics"]).to_csv(index=False))
+        combined = _combined_metrics_csv(reports)
+        if combined:
+            archive.writestr("all_companies.csv", combined)
+    return buf.getvalue()
+
+
+def _coverage_counts(metrics: list[dict]) -> dict:
+    coverage = brsr_coverage_report(metrics) if metrics else {}
+    covered = sum(1 for info in coverage.values() if info["covered"]) if coverage else 0
+    categories = (
+        pd.Series([metric.get("category") for metric in metrics]).value_counts()
+        if metrics else pd.Series(dtype=int)
+    )
+    return {
+        "metrics": len(metrics),
+        "brsr": f"{covered}/9" if metrics else "0/9",
+        "Environmental": int(categories.get("Environmental", 0)),
+        "Social": int(categories.get("Social", 0)),
+        "Governance": int(categories.get("Governance", 0)),
+    }
+
+
+def _metric_cell(metric: dict | None) -> str:
+    if not metric:
+        return "—"
+    year = metric.get("year")
+    year_bit = f" ({year})" if year not in (None, "", "None") else ""
+    unit = metric.get("unit") or ""
+    return f"{metric.get('value')} {unit}{year_bit}".strip()
+
+
+def _shared_metric_rows(reports: list[dict]) -> list[dict]:
+    by_company = []
+    for report in reports:
+        found = {}
+        for metric in report["metrics"]:
+            metric_name = metric.get("metric_name")
+            if not metric_name or metric_name in found:
+                continue
+            found[metric_name] = metric
+        by_company.append((report["name"], found))
+
+    metric_names = []
+    seen = set()
+    for _, found in by_company:
+        for metric_name in found:
+            if metric_name not in seen:
+                seen.add(metric_name)
+                metric_names.append(metric_name)
+
+    rows = []
+    for metric_name in sorted(metric_names):
+        holders = [company for company, found in by_company if metric_name in found]
+        if len(holders) < 2:
+            continue
+        row = {"Metric": metric_name}
+        for company, found in by_company:
+            row[company] = _metric_cell(found.get(metric_name))
+        rows.append(row)
+    return rows
+
+
+def _merged_chat_context(reports: list[dict]):
+    metrics = []
+    topic_index = []
+    page_map = {}
+    texts = []
+    next_page = 1
+    for report in reports:
+        local_map = report.get("page_map") or {}
+        remap = {}
+        for page in sorted(local_map):
+            remap[page] = next_page
+            page_map[next_page] = f"[{report['name']}] {local_map[page]}"
+            next_page += 1
+        for entry in report.get("topic_index") or []:
+            topic_index.append({
+                **entry,
+                "topic": f"{report['name']}: {entry.get('topic', '')}",
+                "pages": [remap[page] for page in entry.get("pages", []) if page in remap],
+            })
+        for metric in report["metrics"]:
+            metrics.append(dict(metric, _company=report["name"]))
+        texts.append(f"\n\n===== {report['name']} =====\n\n{report.get('full_text') or ''}")
+    return metrics, topic_index, page_map, "\n".join(texts)
+
+
+def render_upload_section():
+    uploaded_files = st.file_uploader(
+        "Upload one or more ESG / sustainability / BRSR PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    if not uploaded_files:
+        st.caption(
+            "Select one or more PDFs. Extraction runs in the background — you can close this tab and return later."
         )
         return
 
-    final_name = company_name or "Unknown"
-    st.session_state[slot_key] = {
-        "name": final_name,
-        "metrics": metrics,
-        "topic_index": topic_index,
-        "page_map": page_map,
-        "full_text": text,
-        "chat_history": [],
-    }
-    st.toast(f"✅ Extracted {len(metrics)} metrics and indexed {len(topic_index)} topics for '{final_name}'.", icon="✅")
+    job = load_job()
+    scan_running = _job_is_running(job)
+
+    st.caption("Company names start from the file names. Change any that are wrong before extracting.")
+    company_names = {}
+    for uploaded in uploaded_files:
+        company_names[uploaded.file_id] = st.text_input(
+            f"Company name for {uploaded.name}",
+            value=_display_name_from_filename(uploaded.name),
+            key=f"company_name_{uploaded.file_id}",
+        )
+
+    if scan_running:
+        st.warning("A scan is already running. Open this page again later to see progress and results.")
+        return
+
+    if not st.button("Extract all reports", type="primary"):
+        return
+
+    _persist_reports([])
+    save_job(status="running", message="Preparing files...", progress=0.0, pid=None)
+
+    input_dir = job_input_dir()
+    if os.path.isdir(input_dir):
+        shutil.rmtree(input_dir)
+    os.makedirs(input_dir, exist_ok=True)
+
+    used_names = set()
+    pending_items = []
+    for index, uploaded in enumerate(uploaded_files):
+        company_name = _unique_company_name(company_names.get(uploaded.file_id, ""), used_names)
+        filename = f"{index:03d}.pdf"
+        pdf_path = os.path.join(input_dir, filename)
+        with open(pdf_path, "wb") as handle:
+            handle.write(uploaded.getvalue())
+        pending_items.append({
+            "company": company_name,
+            "path": pdf_path,
+            "source_file": uploaded.name,
+        })
+
+    save_pending_job({"items": pending_items})
+    _spawn_background_extraction(pending_items)
+    st.session_state.pop("extract_notice", None)
+    st.session_state["extract_notice"] = (
+        "Background scan started. You can close this tab; results will appear when you return."
+    )
     st.rerun()
+
+
+def render_results_overview(reports: list[dict]):
+    notice = st.session_state.pop("extract_notice", None)
+    if notice:
+        st.success(notice)
+
+    rows = []
+    for report in reports:
+        counts = _coverage_counts(report["metrics"])
+        if report.get("error"):
+            status = "Failed"
+        elif report.get("metrics"):
+            status = "Ready"
+        else:
+            status = "No metrics"
+        rows.append({
+            "Company": report["name"],
+            "File": report.get("source_file", ""),
+            "Metrics": counts["metrics"],
+            "BRSR principles": counts["brsr"],
+            "Environmental": counts["Environmental"],
+            "Social": counts["Social"],
+            "Governance": counts["Governance"],
+            "Status": status,
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    ready = [report for report in reports if report.get("metrics")]
+    download_col, zip_col, clear_col = st.columns(3)
+    with download_col:
+        if ready:
+            st.download_button(
+                "Download combined CSV",
+                _combined_metrics_csv(ready),
+                file_name="esg_all_companies.csv",
+                mime="text/csv",
+                key="dl_combined_csv",
+            )
+    with zip_col:
+        if ready:
+            st.download_button(
+                "Download all CSVs (zip)",
+                _reports_csv_zip(ready),
+                file_name="esg_company_csvs.zip",
+                mime="application/zip",
+                key="dl_csv_zip",
+            )
+    with clear_col:
+        if st.button("Clear reports"):
+            _persist_reports([])
+            st.rerun()
+
+    if ready:
+        with st.expander("Download one CSV per company"):
+            for index, report in enumerate(ready):
+                st.download_button(
+                    f"CSV — {report['name']}",
+                    _metrics_frame(report["metrics"]).to_csv(index=False),
+                    file_name=f"{_safe_download_stem(report['name'])}.csv",
+                    mime="text/csv",
+                    key=f"dl_one_{index}_{_safe_download_stem(report['name'])}",
+                )
+
+    for report in reports:
+        if report.get("metrics"):
+            continue
+        with st.expander(f"{report['name']} — nothing extracted"):
+            if report.get("error"):
+                st.error(report["error"])
+            for entry in report.get("debug_log") or []:
+                st.write(f"{entry.get('status')}: {entry.get('detail')}")
 
 
 # ---------------------------------------------------------------------
@@ -278,10 +499,10 @@ def render_detail_tab(name: str, data: dict):
     st.subheader("🤖 AI Summary")
     if st.button("Generate summary", key=f"summary_btn_{name}"):
         with st.spinner("Writing summary..."):
-            summary_text = generate_summary(company_name=name, metrics=metrics)
-        st.session_state[f"detail_summary_{name}"] = summary_text
-    if st.session_state.get(f"detail_summary_{name}"):
-        st.markdown(st.session_state[f"detail_summary_{name}"])
+            data["summary"] = generate_summary(company_name=name, metrics=metrics)
+        _persist_reports(st.session_state["reports"])
+    if data.get("summary"):
+        st.markdown(data["summary"])
 
 
 # ---------------------------------------------------------------------
@@ -334,6 +555,7 @@ def render_chat_tab(name: str, data: dict):
                     st.write(f"Tier {d['tier']} — {d['status']}: {d['detail']}")
 
         data["chat_history"].append({"question": question, "answer": result["answer"], "tier": result["tier"]})
+        _persist_reports(st.session_state["reports"])
         st.rerun()
 
 
@@ -630,13 +852,13 @@ def _report_page_ai_summary(name: str, data: dict):
             </div>""",
         unsafe_allow_html=True,
     )
-    cache_key = f"report_summary_{name}"
     if st.button("Generate summary", key=f"report_summary_btn_{name}"):
         with st.spinner("Writing summary..."):
-            st.session_state[cache_key] = generate_summary(company_name=name, metrics=data["metrics"])
+            data["summary"] = generate_summary(company_name=name, metrics=data["metrics"])
+        _persist_reports(st.session_state["reports"])
 
-    if st.session_state.get(cache_key):
-        st.markdown(st.session_state[cache_key])
+    if data.get("summary"):
+        st.markdown(data["summary"])
     else:
         st.caption("Click \"Generate summary\" to produce an AI-written executive summary for this report page.")
 
@@ -793,7 +1015,7 @@ def build_report_pdf(name: str, data: dict, selected_pages: list) -> bytes | Non
         pdf.set_font("Helvetica", "B", 16)
         pdf.cell(0, 10, "Executive Summary", ln=True)
         pdf.set_font("Helvetica", "", 10)
-        summary = st.session_state.get(f"report_summary_{name}")
+        summary = data.get("summary")
         pdf.multi_cell(
             0, 6,
             _safe_pdf_text(summary) if summary else
@@ -1076,84 +1298,95 @@ def render_report_tab(name: str, data: dict):
     )
 
 
-# ---------------------------------------------------------------------
-# Compare tab: directly compares slot_a vs slot_b — no upload box of its
-# own, no dropdown picking. Whatever's in Tab 1 vs whatever's in Tab 2.
-# ---------------------------------------------------------------------
 def render_compare_tab():
-    slot_a, slot_b = st.session_state["slot_a"], st.session_state["slot_b"]
-
-    if not slot_a or not slot_b:
-        missing = []
-        if not slot_a:
-            missing.append("Tab 1")
-        if not slot_b:
-            missing.append("Tab 2 (Add another report)")
-        st.info(f"Upload a report in {' and '.join(missing)} first — Compare shows those two side by side once both are ready.")
+    reports = [report for report in st.session_state["reports"] if report.get("metrics")]
+    if len(reports) < 2:
+        st.info("Extract at least two reports to compare them. A single report can still be downloaded as CSV from All companies.")
         return
 
-    company_a, company_b = slot_a["name"], slot_b["name"]
-    st.caption(f"Comparing **{company_a}** (Tab 1) vs **{company_b}** (Tab 2).")
+    names = [report["name"] for report in reports]
+    st.caption("Comparing " + ", ".join(names) + ".")
 
     summary_rows = []
-    for nm, d in [(company_a, slot_a), (company_b, slot_b)]:
-        cov = brsr_coverage_report(d["metrics"])
-        covered_count = sum(1 for c in cov.values() if c["covered"])
-        cat_counts = pd.Series([x.get("category") for x in d["metrics"]]).value_counts()
+    for report in reports:
+        counts = _coverage_counts(report["metrics"])
         summary_rows.append({
-            "Company": nm,
-            "Metrics extracted": len(d["metrics"]),
-            "BRSR principles covered": f"{covered_count}/9",
-            "Environmental": int(cat_counts.get("Environmental", 0)),
-            "Social": int(cat_counts.get("Social", 0)),
-            "Governance": int(cat_counts.get("Governance", 0)),
+            "Company": report["name"],
+            "Metrics extracted": counts["metrics"],
+            "BRSR principles covered": counts["brsr"],
+            "Environmental": counts["Environmental"],
+            "Social": counts["Social"],
+            "Governance": counts["Governance"],
         })
     summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, width='stretch', hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
     st.bar_chart(summary_df.set_index("Company")[["Environmental", "Social", "Governance"]])
 
-    st.subheader("Compare a specific metric")
+    st.subheader("Metrics found in more than one report")
+    shared_rows = _shared_metric_rows(reports)
+    if shared_rows:
+        shared_df = pd.DataFrame(shared_rows)
+        st.dataframe(shared_df, width="stretch", hide_index=True)
+        st.download_button(
+            "Download comparison CSV",
+            shared_df.to_csv(index=False),
+            file_name="esg_comparison.csv",
+            mime="text/csv",
+            key="dl_shared_csv",
+        )
+    else:
+        st.caption("No metric names matched across companies. Use the lookup below to see who reported a given metric.")
+
+    st.subheader("Look up one metric")
     all_metric_names = sorted({
-        m.get("metric_name") for d in (slot_a, slot_b) for m in d["metrics"] if m.get("metric_name")
+        metric.get("metric_name")
+        for report in reports
+        for metric in report["metrics"]
+        if metric.get("metric_name")
     })
     if all_metric_names:
         chosen_metric = st.selectbox("Metric", all_metric_names, key="compare_metric_select")
         rows = []
-        for nm, d in [(company_a, slot_a), (company_b, slot_b)]:
-            match = next((x for x in d["metrics"] if x.get("metric_name") == chosen_metric), None)
+        for report in reports:
+            match = next((item for item in report["metrics"] if item.get("metric_name") == chosen_metric), None)
             if match:
-                # Value is forced to string here — this column will always
-                # mix real numbers with the text "Not extracted" below, and
-                # mixed number/text columns crash Streamlit's table
-                # renderer (pyarrow) the same way the "year" column did
-                # earlier. Same fix, same reason: this is a display column,
-                # not something we do math on, so text is fine either way.
-                rows.append({"Company": nm, "Value": str(match.get("value")), "Unit": match.get("unit"), "Year": str(match.get("year")) if match.get("year") is not None else ""})
+                year = match.get("year")
+                rows.append({
+                    "Company": report["name"],
+                    "Value": str(match.get("value")),
+                    "Unit": match.get("unit"),
+                    "Year": "" if year is None else str(year),
+                })
             else:
-                # Always show both companies, even when one didn't extract
-                # this metric — explicit "Not extracted" instead of just
-                # silently omitting the row, which looked like a bug.
-                rows.append({"Company": nm, "Value": "Not extracted", "Unit": "—", "Year": "—"})
-        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+                rows.append({"Company": report["name"], "Value": "Not extracted", "Unit": "—", "Year": "—"})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    combined = pd.concat([_safe_metrics_df(slot_a["metrics"]), _safe_metrics_df(slot_b["metrics"])], ignore_index=True)
-    st.download_button(
-        "Download combined comparison CSV",
-        combined.to_csv(index=False),
-        file_name="esg_comparison.csv",
-    )
-    st.download_button(
-        "🎨 Download styled HTML comparison report (Forest Pine design)",
-        _build_comparison_html(company_a, slot_a, company_b, slot_b),
-        file_name=f"{company_a}_vs_{company_b}_Comparison.html",
-        mime="text/html",
-        key="dl_compare_html",
-        help="No extra installs needed. Open the downloaded file in any browser, then use Print → Save as PDF for a PDF copy.",
-    )
+    st.subheader("Styled two-company report")
+    if len(names) == 2:
+        left_name, right_name = names
+    else:
+        pick_left, pick_right = st.columns(2)
+        with pick_left:
+            left_name = st.selectbox("First company", names, key="cmp_left")
+        with pick_right:
+            right_name = st.selectbox("Second company", names, index=1, key="cmp_right")
+    if left_name == right_name:
+        st.caption("Pick two different companies for the styled report.")
+    else:
+        data_left = next(report for report in reports if report["name"] == left_name)
+        data_right = next(report for report in reports if report["name"] == right_name)
+        st.download_button(
+            "Download styled HTML comparison",
+            _build_comparison_html(left_name, data_left, right_name, data_right),
+            file_name=f"{_safe_download_stem(left_name)}_vs_{_safe_download_stem(right_name)}_Comparison.html",
+            mime="text/html",
+            key="dl_compare_html",
+            help="Open the file in a browser, then use Print → Save as PDF.",
+        )
 
-    st.subheader("💬 Ask a comparison question")
-    st.caption(f"Grounded in both {company_a}'s and {company_b}'s extracted data.")
-    combined_metrics = [dict(m, _company=company_a) for m in slot_a["metrics"]] + [dict(m, _company=company_b) for m in slot_b["metrics"]]
+    st.subheader("Ask a comparison question")
+    st.caption("Grounded in every extracted report.")
+    combined_metrics, topic_index, page_map, full_text = _merged_chat_context(reports)
     compare_question = st.chat_input("e.g. Which company has better emissions performance?", key="compare_chat_input")
     if compare_question:
         with st.chat_message("user"):
@@ -1165,11 +1398,11 @@ def render_compare_tab():
 
         result = answer_chat_question(
             question=compare_question,
-            company_name=f"{company_a} vs {company_b}",
+            company_name=" vs ".join(names),
             metrics=combined_metrics,
-            topic_index=slot_a["topic_index"] + slot_b["topic_index"],
-            page_map={**slot_a["page_map"], **slot_b["page_map"]},
-            full_text=slot_a["full_text"] + "\n\n" + slot_b["full_text"],
+            topic_index=topic_index,
+            page_map=page_map,
+            full_text=full_text,
             chat_history=[],
             progress_callback=_cmp_progress,
         )
@@ -1178,26 +1411,14 @@ def render_compare_tab():
             st.write(result["answer"])
 
 
-# ---------------------------------------------------------------------
-# Report slot: shared rendering for Tab 1 and Tab 2 — upload form until
-# a report's extracted, then the Detail / Chat / Report sub-tabs.
-# ---------------------------------------------------------------------
-def render_report_slot(slot_key: str, key_prefix: str, empty_heading: str):
-    data = st.session_state[slot_key]
-
-    if not data:
-        st.header(empty_heading)
-        run_extraction_ui(key_prefix=key_prefix, slot_key=slot_key)
+def render_company_tab():
+    ready = [report for report in st.session_state["reports"] if report.get("metrics")]
+    if not ready:
+        st.info("No report produced metrics to open.")
         return
 
-    col_title, col_reset = st.columns([5, 1])
-    with col_title:
-        st.subheader(f"📄 {data['name']}")
-    with col_reset:
-        if st.button("🔄 Replace", key=f"{key_prefix}_reset", help="Upload a different report into this slot"):
-            st.session_state[slot_key] = None
-            st.rerun()
-
+    selected = st.selectbox("Company", [report["name"] for report in ready], key="open_company")
+    data = next(report for report in ready if report["name"] == selected)
     detail_tab, chat_tab, report_tab = st.tabs(["Detail", "Chat", "Report"])
     with detail_tab:
         render_detail_tab(data["name"], data)
@@ -1207,18 +1428,36 @@ def render_report_slot(slot_key: str, key_prefix: str, empty_heading: str):
         render_report_tab(data["name"], data)
 
 
-# ---------------------------------------------------------------------
-# Main layout — three fixed tabs: Tab 1 (slot A), Tab 2 / Add another
-# report (slot B), Compare (reads both slots directly).
-# ---------------------------------------------------------------------
-tab1_label = f"📄 {st.session_state['slot_a']['name']}" if st.session_state["slot_a"] else "⬆️ Upload Your First Report"
-top_tabs = st.tabs([tab1_label, "➕ Add another report", "📈 Compare"])
+_poll_background_job()
 
-with top_tabs[0]:
-    render_report_slot("slot_a", key_prefix="a", empty_heading="Upload a report to get started")
+reports = st.session_state["reports"]
+job = load_job()
+scan_running = _job_is_running(job)
+if job.get("status") == "completed":
+    notice = job.get("message")
+    if notice and st.session_state.get("_last_completed_job_message") != notice:
+        st.session_state["_last_completed_job_message"] = notice
+        st.session_state["extract_notice"] = notice
+elif job.get("status") == "failed" and job.get("message"):
+    st.error(job.get("message"))
 
-with top_tabs[1]:
-    render_report_slot("slot_b", key_prefix="b", empty_heading="Upload a second report to compare")
+if not reports and not scan_running:
+    st.header("Upload reports")
+    render_upload_section()
+elif scan_running and not reports:
+    st.header("Scan in progress")
+    render_upload_section()
+else:
+    ready_count = sum(1 for report in reports if report.get("metrics"))
+    st.caption(f"{ready_count} of {len(reports)} reports have extracted metrics.")
+    with st.expander("Run a new scan", expanded=False):
+        render_upload_section()
+        st.caption("Starting a new extract clears the previous scan. Use Clear reports to remove everything without uploading.")
 
-with top_tabs[2]:
-    render_compare_tab()
+    all_tab, compare_tab, company_tab = st.tabs(["All companies", "Compare", "One company"])
+    with all_tab:
+        render_results_overview(reports)
+    with compare_tab:
+        render_compare_tab()
+    with company_tab:
+        render_company_tab()
