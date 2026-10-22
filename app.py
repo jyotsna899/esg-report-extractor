@@ -50,6 +50,8 @@ from extractor import (
     generate_summary,
     BRSR_PRINCIPLES,
 )
+from pipeline import extract_one_pdf
+from runtime import apply_streamlit_secrets, is_streamlit_cloud
 from store import (
     data_dir,
     job_input_dir,
@@ -61,16 +63,15 @@ from store import (
 )
 
 st.set_page_config(page_title="ESG Report Extractor", layout="wide")
+apply_streamlit_secrets()
 
 if not os.environ.get("GEMINI_API_KEY"):
     st.error(
-        "⚠️ GEMINI_API_KEY is not set in this environment. Extraction and "
-        "chat will fail until you set it. In your terminal, before running "
-        "Streamlit:\n\n"
-        "  macOS/Linux: `export GEMINI_API_KEY=your_key_here`\n\n"
-        "  Windows (PowerShell): `$env:GEMINI_API_KEY='your_key_here'`\n\n"
-        "Then restart `streamlit run app.py`. Get a key at "
-        "https://aistudio.google.com/apikey"
+        "GEMINI_API_KEY is not set. Extraction and chat will fail until you add it.\n\n"
+        "Local: put it in `.env` or run `export GEMINI_API_KEY=...` before Streamlit.\n\n"
+        "Streamlit Cloud: Manage app → Settings → Secrets:\n\n"
+        "GEMINI_API_KEY = \"your-key-here\"\n\n"
+        "Get a key at https://aistudio.google.com/apikey"
     )
 
 st.title("📊 AI-Powered ESG Extraction & Comparative Benchmarking Platform")
@@ -350,12 +351,72 @@ def render_upload_section():
             "source_file": uploaded.name,
         })
 
+    if is_streamlit_cloud():
+        _run_inline_extraction(pending_items)
+        return
+
     save_pending_job({"items": pending_items})
     _spawn_background_extraction(pending_items)
     st.session_state.pop("extract_notice", None)
     st.session_state["extract_notice"] = (
         "Background scan started. You can close this tab; results will appear when you return."
     )
+    st.rerun()
+
+
+def _run_inline_extraction(pending_items):
+    reports = []
+    total = len(pending_items)
+    progress = st.progress(0.0, text="Starting...")
+    save_job(status="running", message="Extracting on Streamlit Cloud...", progress=0.0, pid=None, total_count=total)
+
+    for index, item in enumerate(pending_items):
+        company_name = item["company"]
+        pdf_path = item["path"]
+        source_file = item.get("source_file", os.path.basename(pdf_path))
+
+        def on_status(fraction, status_text, index=index, company_name=company_name):
+            overall = (index + max(0.0, min(fraction, 1.0))) / total
+            progress.progress(overall, text=f"{company_name} ({index + 1}/{total}): {status_text}")
+            save_job(
+                status="running",
+                progress=overall,
+                message=f"{company_name} ({index + 1}/{total}): {status_text}",
+                current_index=index + 1,
+                total_count=total,
+            )
+
+        try:
+            report = extract_one_pdf(pdf_path, company_name, on_status)
+            report["source_file"] = source_file
+            reports.append(report)
+        except Exception as exc:
+            reports.append({
+                "name": company_name,
+                "source_file": source_file,
+                "metrics": [],
+                "topic_index": [],
+                "page_map": {},
+                "full_text": "",
+                "chat_history": [],
+                "summary": "",
+                "debug_log": [{"chunk": 0, "status": "error", "detail": str(exc)}],
+                "error": str(exc),
+            })
+        _persist_reports(reports)
+
+    ready_count = sum(1 for report in reports if report.get("metrics"))
+    notice = f"Finished. {ready_count} of {total} files produced metrics."
+    save_job(
+        status="completed",
+        progress=1.0,
+        message=notice,
+        ready_count=ready_count,
+        total_count=total,
+        current_index=total,
+    )
+    progress.progress(1.0, text="Finished")
+    st.session_state["extract_notice"] = notice
     st.rerun()
 
 
