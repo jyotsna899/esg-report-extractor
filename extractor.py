@@ -19,10 +19,27 @@ Usage:
 """
 
 import json
+import os
 import re
 import time
 import pdfplumber
 from google import genai
+
+
+def _load_env_file():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ[key.strip()] = value.strip().strip('"').strip("'")
+
+
+_load_env_file()
 
 
 # Roughly 1 token ≈ 4 characters. Free-tier Gemini rate limits cap input
@@ -36,7 +53,7 @@ SINGLE_CALL_CHAR_LIMIT = 150_000
 # limit. (Previously 400,000 — large enough that a full-document "scan
 # whole doc" run could collapse into a single oversized call.)
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-3.5-flash-lite"
 MAX_OUTPUT_TOKENS = 65_536
 # temperature=0 makes the model always pick its most confident output
 # instead of sampling somewhat randomly. It won't guarantee byte-identical
@@ -70,13 +87,13 @@ P9 (Consumer Value): responsible value delivery to consumers — product labelin
 # assigned per project), so instead of guessing a safe number we just
 # back off and retry whenever we actually hit a 429.
 # ---------------------------------------------------------------------
-def _call_gemini_with_retry(client, contents, config, max_retries=3, progress_callback=None):
+def _call_gemini_with_retry(client, contents, config, max_retries=4, progress_callback=None):
     # temperature=0 by default on every call in this file, applied once
     # here rather than at each call site — every caller passes its own
     # config dict (response_mime_type, max_output_tokens, etc.), so we
     # merge temperature in without needing to touch every call site.
     config = {"temperature": TEMPERATURE, **config}
-    delay = 30
+    delay = 5
     last_error = None
     for attempt in range(max_retries + 1):
         try:
@@ -84,15 +101,22 @@ def _call_gemini_with_retry(client, contents, config, max_retries=3, progress_ca
         except Exception as e:
             last_error = e
             msg = str(e)
-            is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate limit" in msg.lower()
-            if is_rate_limit and attempt < max_retries:
+            retryable = (
+                "429" in msg
+                or "503" in msg
+                or "RESOURCE_EXHAUSTED" in msg
+                or "UNAVAILABLE" in msg
+                or "rate limit" in msg.lower()
+                or "high demand" in msg.lower()
+            )
+            if retryable and attempt < max_retries:
                 if progress_callback:
                     progress_callback(
                         0, 1,
-                        f"Rate limited — waiting {delay}s before retry ({attempt + 1}/{max_retries})...",
+                        f"Model busy — waiting {delay}s before retry ({attempt + 1}/{max_retries})...",
                     )
                 time.sleep(delay)
-                delay *= 2
+                delay = min(delay * 2, 30)
                 continue
             raise
     raise last_error
@@ -344,7 +368,7 @@ def extract_esg_metrics(
         if idx > 0:
             if progress_callback:
                 progress_callback(idx + 1, total, f"Waiting to stay under rate limits (chunk {idx + 1}/{total})...")
-            time.sleep(20)
+            time.sleep(2)
 
         try:
             response = _call_gemini_with_retry(
@@ -720,7 +744,7 @@ def answer_chat_question(
         except Exception as e:
             debug.append({"tier": 3, "status": "error", "detail": f"chunk {idx + 1}: {e}"})
         if idx < len(chunks) - 1:
-            time.sleep(20)
+            time.sleep(2)
 
     debug.append({"tier": 3, "status": "not_found", "detail": "Scanned the full report, no answer found."})
     return {
