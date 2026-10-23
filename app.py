@@ -10,6 +10,7 @@ Upload a company sustainability/ESG/BRSR report PDF and get:
 Run locally with:  streamlit run app.py
 """
 
+import gc
 import json
 import os
 import io
@@ -17,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 
 import pandas as pd
@@ -53,13 +55,18 @@ from extractor import (
 from pipeline import extract_one_pdf
 from runtime import apply_streamlit_secrets, is_streamlit_cloud
 from store import (
+    clear_pending_job,
     data_dir,
     job_input_dir,
     load_job,
+    load_pending_job,
     load_reports,
+    mark_pending_item_done,
+    remaining_pending_items,
     save_job,
     save_pending_job,
     save_reports,
+    upsert_report,
 )
 
 st.set_page_config(page_title="ESG Report Extractor", layout="wide")
@@ -119,9 +126,28 @@ def _job_is_running(job):
         return False
     pid = job.get("pid")
     if pid is None:
-        return True
+        if is_streamlit_cloud() and st.session_state.get("_inline_step_active"):
+            return True
+        remaining = remaining_pending_items()
+        if remaining:
+            next_name = remaining[0][1].get("company", "next PDF")
+            save_job(
+                status="failed",
+                message=f"Extraction paused before {next_name} ({len(remaining)} remaining). Saved reports are available below.",
+            )
+        else:
+            save_job(status="completed", message="Finished.", progress=1.0)
+        return False
     if not _job_process_alive(pid):
-        save_job(status="failed", message="Background worker stopped before finishing.")
+        remaining = remaining_pending_items()
+        if remaining:
+            next_name = remaining[0][1].get("company", "next PDF")
+            save_job(
+                status="failed",
+                message=f"Worker stopped at {next_name} ({len(remaining)} remaining). Completed reports are saved below.",
+            )
+        else:
+            save_job(status="failed", message="Background worker stopped before finishing.")
         return False
     return True
 
@@ -137,14 +163,15 @@ def _spawn_background_extraction(items):
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
+    done_count = sum(1 for item in items if item.get("done"))
     save_job(
         status="running",
-        message="Starting background extraction...",
-        progress=0.0,
+        message="Starting one-by-one extraction...",
+        progress=done_count / max(len(items), 1),
         pid=process.pid,
-        ready_count=0,
+        ready_count=sum(1 for r in st.session_state.get("reports", []) if r.get("metrics")),
         total_count=len(items),
-        current_index=0,
+        current_index=done_count,
         error=None,
     )
 
@@ -298,6 +325,69 @@ def _merged_chat_context(reports: list[dict]):
     return metrics, topic_index, page_map, "\n".join(texts)
 
 
+def _find_existing_report(reports: list[dict], company_name: str, source_file: str):
+    for report in reports:
+        if not report.get("metrics"):
+            continue
+        if source_file and report.get("source_file") == source_file:
+            return report
+        if company_name and report.get("name") == company_name:
+            return report
+    return None
+
+
+def _start_or_resume_queue():
+    pending = load_pending_job()
+    items = (pending or {}).get("items") or []
+    remaining = remaining_pending_items()
+    if not remaining:
+        return
+    if is_streamlit_cloud():
+        st.session_state["_inline_auto_continue"] = True
+        st.rerun()
+    else:
+        _spawn_background_extraction(items)
+        st.session_state["extract_notice"] = (
+            "Resumed one-by-one background extraction. Completed reports remain available below."
+        )
+        st.rerun()
+
+
+def render_resume_banner(scan_running: bool):
+    if scan_running:
+        return
+    remaining = remaining_pending_items()
+    if not remaining:
+        return
+    pending = load_pending_job() or {}
+    total = len(pending.get("items") or [])
+    done_count = total - len(remaining)
+    next_index, next_item = remaining[0]
+    next_company = next_item.get("company") or next_item.get("source_file") or f"PDF {next_index + 1}"
+    remaining_names = ", ".join(
+        item.get("company") or item.get("source_file") or f"PDF {idx + 1}"
+        for idx, item in remaining
+    )
+    st.warning(
+        f"**Unfinished batch detected ({done_count} of {total} processed).** "
+        f"Saved reports are ready below. Remaining in queue: **{remaining_names}**."
+    )
+    col_resume, col_skip, col_discard = st.columns(3)
+    with col_resume:
+        if st.button(f"▶️ Resume from {next_company} ({len(remaining)} left)", type="primary", key="btn_resume_queue"):
+            _start_or_resume_queue()
+    with col_skip:
+        if len(remaining) > 1:
+            if st.button(f"⏭️ Skip {next_company} & continue", key="btn_skip_next"):
+                mark_pending_item_done(next_index)
+                _start_or_resume_queue()
+    with col_discard:
+        if st.button("🗑️ Discard remaining queue", key="btn_discard_queue"):
+            clear_pending_job()
+            save_job(status="completed", message="Queue cleared. Saved reports kept.", progress=1.0)
+            st.rerun()
+
+
 def render_upload_section():
     uploaded_files = st.file_uploader(
         "Upload one or more ESG / sustainability / BRSR PDFs",
@@ -306,7 +396,7 @@ def render_upload_section():
     )
     if not uploaded_files:
         st.caption(
-            "Select one or more PDFs. Extraction runs in the background — you can close this tab and return later."
+            "Select one or more PDFs. PDFs are processed 1 at a time and saved immediately after each file."
         )
         return
 
@@ -323,100 +413,174 @@ def render_upload_section():
         )
 
     if scan_running:
-        st.warning("A scan is already running. Open this page again later to see progress and results.")
+        st.warning("A scan is already running. Completed PDFs appear automatically as each one finishes.")
         return
 
-    if not st.button("Extract all reports", type="primary"):
+    existing_reports = st.session_state.get("reports", [])
+    already_done = []
+    for uploaded in uploaded_files:
+        cname = company_names.get(uploaded.file_id, "").strip()
+        if _find_existing_report(existing_reports, cname, uploaded.name):
+            already_done.append(cname or uploaded.name)
+
+    reextract_existing = False
+    if already_done:
+        st.info(
+            f"Already extracted and saved: **{', '.join(already_done)}**. "
+            "By default, these will be kept and skipped so extraction continues from the remaining PDFs."
+        )
+        reextract_existing = st.checkbox(
+            "Re-extract files that already have saved reports",
+            value=False,
+            key="reextract_existing_chk",
+        )
+
+    btn_label = (
+        f"Extract remaining reports ({len(uploaded_files) - len(already_done)})"
+        if already_done and not reextract_existing and len(uploaded_files) > len(already_done)
+        else "Extract all reports (1 PDF at a time)"
+    )
+    if not st.button(btn_label, type="primary"):
         return
 
-    _persist_reports([])
-    save_job(status="running", message="Preparing files...", progress=0.0, pid=None)
+    if reextract_existing:
+        _persist_reports([])
+        existing_reports = []
 
     input_dir = job_input_dir()
     if os.path.isdir(input_dir):
-        shutil.rmtree(input_dir)
+        shutil.rmtree(input_dir, ignore_errors=True)
     os.makedirs(input_dir, exist_ok=True)
 
-    used_names = set()
+    used_names = {r.get("name", "") for r in existing_reports if r.get("name") and not reextract_existing}
     pending_items = []
     for index, uploaded in enumerate(uploaded_files):
-        company_name = _unique_company_name(company_names.get(uploaded.file_id, ""), used_names)
+        raw_name = company_names.get(uploaded.file_id, "").strip() or _display_name_from_filename(uploaded.name)
+        matched = None if reextract_existing else _find_existing_report(existing_reports, raw_name, uploaded.name)
+        if matched:
+            pending_items.append({
+                "company": matched["name"],
+                "path": "",
+                "source_file": uploaded.name,
+                "done": True,
+            })
+            continue
+
+        company_name = _unique_company_name(raw_name, used_names)
         filename = f"{index:03d}.pdf"
         pdf_path = os.path.join(input_dir, filename)
+        uploaded.seek(0)
         with open(pdf_path, "wb") as handle:
-            handle.write(uploaded.getvalue())
+            shutil.copyfileobj(uploaded, handle)
         pending_items.append({
             "company": company_name,
             "path": pdf_path,
             "source_file": uploaded.name,
+            "done": False,
         })
 
-    if is_streamlit_cloud():
-        _run_inline_extraction(pending_items)
-        return
-
+    gc.collect()
     save_pending_job({"items": pending_items})
+
+    to_process = [item for item in pending_items if not item.get("done")]
+    if not to_process:
+        clear_pending_job()
+        st.session_state["extract_notice"] = "All selected PDFs already have saved reports."
+        st.rerun()
+
+    if is_streamlit_cloud():
+        st.session_state["_inline_auto_continue"] = True
+        st.rerun()
+
     _spawn_background_extraction(pending_items)
     st.session_state.pop("extract_notice", None)
     st.session_state["extract_notice"] = (
-        "Background scan started. You can close this tab; results will appear when you return."
+        "One-by-one background scan started. Each PDF is saved as soon as it finishes."
     )
     st.rerun()
 
 
-def _run_inline_extraction(pending_items):
-    reports = []
-    total = len(pending_items)
-    progress = st.progress(0.0, text="Starting...")
-    save_job(status="running", message="Extracting on Streamlit Cloud...", progress=0.0, pid=None, total_count=total)
+def _run_next_inline_step(status_container=None):
+    target = status_container if status_container is not None else st
+    remaining = remaining_pending_items()
+    if not remaining:
+        st.session_state.pop("_inline_auto_continue", None)
+        st.session_state.pop("_inline_step_active", None)
+        clear_pending_job()
+        reports = load_reports()
+        _sync_reports()
+        ready_count = sum(1 for report in reports if report.get("metrics"))
+        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced metrics."
+        save_job(
+            status="completed",
+            progress=1.0,
+            message=notice,
+            ready_count=ready_count,
+            total_count=len(reports),
+            current_index=len(reports),
+        )
+        st.session_state["extract_notice"] = notice
+        return
 
-    for index, item in enumerate(pending_items):
-        company_name = item["company"]
-        pdf_path = item["path"]
-        source_file = item.get("source_file", os.path.basename(pdf_path))
+    pending = load_pending_job() or {}
+    items = pending.get("items") or []
+    total = max(len(items), 1)
+    index, item = remaining[0]
+    company_name = item.get("company", f"PDF {index + 1}")
 
-        def on_status(fraction, status_text, index=index, company_name=company_name):
-            overall = (index + max(0.0, min(fraction, 1.0))) / total
-            progress.progress(overall, text=f"{company_name} ({index + 1}/{total}): {status_text}")
-            save_job(
-                status="running",
-                progress=overall,
-                message=f"{company_name} ({index + 1}/{total}): {status_text}",
-                current_index=index + 1,
-                total_count=total,
-            )
-
-        try:
-            report = extract_one_pdf(pdf_path, company_name, on_status)
-            report["source_file"] = source_file
-            reports.append(report)
-        except Exception as exc:
-            reports.append({
-                "name": company_name,
-                "source_file": source_file,
-                "metrics": [],
-                "topic_index": [],
-                "page_map": {},
-                "full_text": "",
-                "chat_history": [],
-                "summary": "",
-                "debug_log": [{"chunk": 0, "status": "error", "detail": str(exc)}],
-                "error": str(exc),
-            })
-        _persist_reports(reports)
-
-    ready_count = sum(1 for report in reports if report.get("metrics"))
-    notice = f"Finished. {ready_count} of {total} files produced metrics."
-    save_job(
-        status="completed",
-        progress=1.0,
-        message=notice,
-        ready_count=ready_count,
-        total_count=total,
-        current_index=total,
+    st.session_state["_inline_step_active"] = True
+    progress = target.progress(
+        index / total,
+        text=f"Processing 1 PDF at a time — {company_name} ({index + 1}/{total})...",
     )
-    progress.progress(1.0, text="Finished")
-    st.session_state["extract_notice"] = notice
+    root = os.path.dirname(os.path.abspath(__file__))
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(root, "background_job.py"), "--single-index", str(index)],
+        cwd=root,
+    )
+    while proc.poll() is None:
+        time.sleep(0.5)
+        job = load_job()
+        progress.progress(
+            float(job.get("progress") or (index / total)),
+            text=job.get("message") or f"Processing {company_name} ({index + 1}/{total})...",
+        )
+
+    st.session_state.pop("_inline_step_active", None)
+    _sync_reports()
+    gc.collect()
+
+    if proc.returncode != 0:
+        st.session_state.pop("_inline_auto_continue", None)
+        reports = st.session_state.get("reports", [])
+        ready_count = sum(1 for r in reports if r.get("metrics"))
+        save_job(
+            status="failed",
+            message=(
+                f"Stopped while processing {company_name} (PDF {index + 1} of {total}). "
+                f"{ready_count} completed report(s) are saved. Click Resume to continue."
+            ),
+            ready_count=ready_count,
+            current_index=index + 1,
+            total_count=total,
+        )
+        st.rerun()
+
+    if not remaining_pending_items():
+        st.session_state.pop("_inline_auto_continue", None)
+        clear_pending_job()
+        reports = st.session_state.get("reports", [])
+        ready_count = sum(1 for r in reports if r.get("metrics"))
+        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced metrics."
+        save_job(
+            status="completed",
+            progress=1.0,
+            message=notice,
+            ready_count=ready_count,
+            total_count=total,
+            current_index=total,
+        )
+        st.session_state["extract_notice"] = notice
     st.rerun()
 
 
@@ -468,7 +632,9 @@ def render_results_overview(reports: list[dict]):
             )
     with clear_col:
         if st.button("Clear reports"):
+            clear_pending_job()
             _persist_reports([])
+            save_job(status="idle", message="", progress=0.0, pid=None, ready_count=0, total_count=0, current_index=0, error=None)
             st.rerun()
 
     if ready:
@@ -1502,18 +1668,21 @@ if job.get("status") == "completed":
 elif job.get("status") == "failed" and job.get("message"):
     st.error(job.get("message"))
 
-if not reports and not scan_running:
+render_resume_banner(scan_running)
+inline_status_box = st.container()
+
+if not reports and not scan_running and not st.session_state.get("_inline_auto_continue"):
     st.header("Upload reports")
     render_upload_section()
-elif scan_running and not reports:
+elif (scan_running or st.session_state.get("_inline_auto_continue")) and not reports:
     st.header("Scan in progress")
     render_upload_section()
 else:
     ready_count = sum(1 for report in reports if report.get("metrics"))
     st.caption(f"{ready_count} of {len(reports)} reports have extracted metrics.")
-    with st.expander("Run a new scan", expanded=False):
+    with st.expander("Add or extract more reports", expanded=False):
         render_upload_section()
-        st.caption("Starting a new extract clears the previous scan. Use Clear reports to remove everything without uploading.")
+        st.caption("Already-extracted reports are preserved automatically. Use Clear reports to remove everything.")
 
     all_tab, compare_tab, company_tab = st.tabs(["All companies", "Compare", "One company"])
     with all_tab:
@@ -1522,3 +1691,6 @@ else:
         render_compare_tab()
     with company_tab:
         render_company_tab()
+
+if is_streamlit_cloud() and st.session_state.get("_inline_auto_continue"):
+    _run_next_inline_step(inline_status_box)

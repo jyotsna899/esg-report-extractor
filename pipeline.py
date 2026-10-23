@@ -1,3 +1,4 @@
+import gc
 from extractor import extract_esg_metrics, extract_text_from_pdf
 
 
@@ -19,6 +20,7 @@ def extract_one_pdf(path, company_name, on_status):
     metrics, debug_log, topic_index, page_map = extract_esg_metrics(
         text, company_name=company_name, progress_callback=metric_cb,
     )
+    gc.collect()
     return {
         "name": company_name,
         "metrics": metrics,

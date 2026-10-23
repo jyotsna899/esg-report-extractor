@@ -18,6 +18,7 @@ Usage:
     result = answer_chat_question("Tell me about their rainwater harvesting", "Acme Corp", metrics, topic_index, page_map, text)
 """
 
+import gc
 import json
 import os
 import re
@@ -125,6 +126,18 @@ def _call_gemini_with_retry(client, contents, config, max_retries=4, progress_ca
 # ---------------------------------------------------------------------
 # Step 1: Pull text out of the PDF
 # ---------------------------------------------------------------------
+def _flush_pdf_page(page):
+    try:
+        page.flush_cache()
+    except Exception:
+        pass
+    try:
+        if hasattr(page, "get_textmap") and hasattr(page.get_textmap, "cache_clear"):
+            page.get_textmap.cache_clear()
+    except Exception:
+        pass
+
+
 def find_brsr_start_page(pdf_path: str, progress_callback=None) -> int | None:
     """
     Scans the PDF for the page where the ESG/sustainability/BRSR section
@@ -163,6 +176,7 @@ def find_brsr_start_page(pdf_path: str, progress_callback=None) -> int | None:
         blank_pages = 0
         for i, page in enumerate(pdf.pages):
             text = page.extract_text()
+            _flush_pdf_page(page)
             if progress_callback:
                 progress_callback(i + 1, total_pages)
             if not text:
@@ -217,10 +231,12 @@ def extract_text_from_pdf(pdf_path: str, max_pages: int = 200, start_page: int =
         total = len(pages)
         for i, page in enumerate(pages):
             text = page.extract_text()
+            _flush_pdf_page(page)
             if text:
                 full_text.append(f"\n--- Page {start_idx + i + 1} ---\n{text}")
             if progress_callback:
                 progress_callback(i + 1, total)
+    gc.collect()
     return "\n".join(full_text)
 
 
@@ -458,6 +474,7 @@ def extract_esg_metrics(
                 "detail": f"{e}. finish_reason={finish_reason}{truncation_note} Raw response (first 500 chars): {raw[:500]!r}",
             })
 
+    gc.collect()
     return all_metrics, debug_log, topic_index, page_map
 
 
