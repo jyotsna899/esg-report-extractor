@@ -63,7 +63,7 @@ def load_reports(path=None):
         else:
             report["page_map"] = {}
         report.setdefault("chat_history", [])
-        report.setdefault("metrics", [])
+        report.setdefault("kpis", [])
         report.setdefault("topic_index", [])
         report.setdefault("full_text", "")
         report.setdefault("summary", "")

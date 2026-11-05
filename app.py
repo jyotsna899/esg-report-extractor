@@ -2,7 +2,7 @@
 ESG Report Extractor — Streamlit Demo
 ---------------------------------------
 Upload a company sustainability/ESG/BRSR report PDF and get:
-  - Detail tab: metrics grouped by BRSR principle + an AI summary
+  - Detail tab: the fixed KPI list (current + previous year) by category + an AI summary
   - Chat tab: ask follow-up questions, grounded in the extracted data,
     escalating to the real report text only when it needs to
   - Compare tab: line two (or more) companies up side by side
@@ -25,7 +25,6 @@ import pandas as pd
 import streamlit as st
 
 try:
-    import plotly.express as px
     import plotly.graph_objects as go
     PLOTLY_AVAILABLE = True
 except ImportError:
@@ -45,12 +44,18 @@ try:
 except ImportError:
     FPDF_AVAILABLE = False
 
-from extractor import (
-    brsr_coverage_report,
-    identify_red_flags,
-    answer_chat_question,
-    generate_summary,
-    BRSR_PRINCIPLES,
+from extractor import answer_chat_question, generate_summary
+from kpis import (
+    CATEGORIES,
+    KPI_BY_ID,
+    KPI_CATALOG,
+    coverage as kpi_coverage,
+    format_year,
+    headline_value,
+    is_disclosed,
+    is_legacy_report,
+    report_ready,
+    yoy_change,
 )
 from pipeline import extract_one_pdf
 from runtime import apply_streamlit_secrets, is_streamlit_cloud
@@ -84,8 +89,8 @@ if not os.environ.get("GEMINI_API_KEY"):
 st.title("📊 AI-Powered ESG Extraction & Comparative Benchmarking Platform")
 st.caption(
     "Upload one or more sustainability / ESG / BRSR report PDFs. "
-    "The tool extracts quantifiable ESG metrics, maps them to GRI codes and "
-    "BRSR Core principles, compares the companies, and downloads CSV files."
+    "The tool extracts a fixed set of ESG and financial KPIs (current and previous "
+    "year), converts them to standard units, compares the companies, and downloads CSV files."
 )
 
 def _stored_mtime():
@@ -169,7 +174,7 @@ def _spawn_background_extraction(items):
         message="Starting one-by-one extraction...",
         progress=done_count / max(len(items), 1),
         pid=process.pid,
-        ready_count=sum(1 for r in st.session_state.get("reports", []) if r.get("metrics")),
+        ready_count=sum(1 for r in st.session_state.get("reports", []) if report_ready(r)),
         total_count=len(items),
         current_index=done_count,
         error=None,
@@ -209,14 +214,50 @@ def _safe_download_stem(name: str) -> str:
     return cleaned or "report"
 
 
-def _metrics_frame(metrics: list[dict]) -> pd.DataFrame:
-    if not metrics:
-        return pd.DataFrame()
-    return _safe_metrics_df(metrics)
+# ---------------------------------------------------------------------
+# KPI table helpers — every report has the same rows, keyed by KPI ID
+# ---------------------------------------------------------------------
+STATUS_LABELS = {
+    "reported": "Reported",
+    "derived": "Derived",
+    "reported_unit_mismatch": "Reported (unit differs)",
+    "not_disclosed": "Not disclosed",
+}
 
 
-def _combined_metrics_csv(reports: list[dict]) -> str:
-    frames = [_metrics_frame(report["metrics"]) for report in reports if report.get("metrics")]
+def _kpi_unit(record: dict) -> str:
+    cur, prev = record.get("current") or {}, record.get("previous") or {}
+    return cur.get("unit") or prev.get("unit") or record.get("required_unit") or ""
+
+
+def kpi_frame(kpis: list[dict], company: str | None = None) -> pd.DataFrame:
+    """One row per KPI. Every cell is a string, so pyarrow never sees mixed types."""
+    rows = []
+    for r in kpis or []:
+        cur, prev = r.get("current") or {}, r.get("previous") or {}
+        change = yoy_change(r)
+        row = {"Company": company} if company is not None else {}
+        row.update({
+            "ID": r["kpi_id"],
+            "KPI": r["kpi_name"],
+            "Category": r["category"],
+            "Current FY": cur.get("fy") or "",
+            "Current": format_year(cur),
+            "Previous FY": prev.get("fy") or "",
+            "Previous": format_year(prev),
+            "YoY %": "" if change is None else f"{change:+.1f}%",
+            "Unit": _kpi_unit(r),
+            "Status": STATUS_LABELS.get(r.get("status"), r.get("status") or ""),
+            "Derivation": r.get("derivation") or "",
+            "Pages": ", ".join(str(p) for p in r.get("pages") or []),
+            "Source": r.get("source_context") or "",
+        })
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _combined_kpi_csv(reports: list[dict]) -> str:
+    frames = [kpi_frame(report["kpis"], company=report["name"]) for report in reports if report_ready(report)]
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return ""
@@ -228,7 +269,7 @@ def _reports_csv_zip(reports: list[dict]) -> bytes:
     used = set()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for report in reports:
-            if not report.get("metrics"):
+            if not report_ready(report):
                 continue
             stem = _safe_download_stem(report["name"])
             filename = f"{stem}.csv"
@@ -237,71 +278,67 @@ def _reports_csv_zip(reports: list[dict]) -> bytes:
                 filename = f"{stem}_{n}.csv"
                 n += 1
             used.add(filename)
-            archive.writestr(filename, _metrics_frame(report["metrics"]).to_csv(index=False))
-        combined = _combined_metrics_csv(reports)
+            archive.writestr(filename, kpi_frame(report["kpis"]).to_csv(index=False))
+        combined = _combined_kpi_csv(reports)
         if combined:
             archive.writestr("all_companies.csv", combined)
     return buf.getvalue()
 
 
-def _coverage_counts(metrics: list[dict]) -> dict:
-    coverage = brsr_coverage_report(metrics) if metrics else {}
-    covered = sum(1 for info in coverage.values() if info["covered"]) if coverage else 0
-    categories = (
-        pd.Series([metric.get("category") for metric in metrics]).value_counts()
-        if metrics else pd.Series(dtype=int)
-    )
-    return {
-        "metrics": len(metrics),
-        "brsr": f"{covered}/9" if metrics else "0/9",
-        "Environmental": int(categories.get("Environmental", 0)),
-        "Social": int(categories.get("Social", 0)),
-        "Governance": int(categories.get("Governance", 0)),
+def _coverage_counts(kpis: list[dict]) -> dict:
+    cov = kpi_coverage(kpis or [])
+    out = {
+        "disclosed": f"{cov['disclosed']}/{cov['total']}" if kpis else f"0/{cov['total']}",
+        "disclosed_n": cov["disclosed"] if kpis else 0,
+        "derived": cov["derived"] if kpis else 0,
     }
+    for cat in CATEGORIES:
+        n = cov["by_category"][cat] if kpis else 0
+        out[cat] = f"{n}/{cov['category_totals'][cat]}"
+        out[f"{cat}_n"] = n
+    return out
 
 
-def _metric_cell(metric: dict | None) -> str:
-    if not metric:
+def _report_status(report: dict) -> str:
+    if report.get("error"):
+        return "Failed"
+    if is_legacy_report(report):
+        return "Needs re-extraction"
+    if report_ready(report):
+        return "Ready"
+    return "No KPIs found"
+
+
+def _kpi_cell(record: dict | None, year: str = "current") -> str:
+    if not record or not is_disclosed(record):
         return "—"
-    year = metric.get("year")
-    year_bit = f" ({year})" if year not in (None, "", "None") else ""
-    unit = metric.get("unit") or ""
-    return f"{metric.get('value')} {unit}{year_bit}".strip()
+    slot = record.get(year) or {}
+    text = format_year(slot)
+    if not text:
+        return "—"
+    fy = slot.get("fy")
+    year_status = record.get("year_status", {}).get(year)
+    flag = " *" if year_status == "derived" else ""
+    if year_status == "reported_unit_mismatch" and slot.get("unit"):
+        flag = f" {slot['unit']} (unit differs)"
+    return f"{text}{flag}" + (f" ({fy})" if fy else "")
 
 
-def _shared_metric_rows(reports: list[dict]) -> list[dict]:
-    by_company = []
-    for report in reports:
-        found = {}
-        for metric in report["metrics"]:
-            metric_name = metric.get("metric_name")
-            if not metric_name or metric_name in found:
-                continue
-            found[metric_name] = metric
-        by_company.append((report["name"], found))
-
-    metric_names = []
-    seen = set()
-    for _, found in by_company:
-        for metric_name in found:
-            if metric_name not in seen:
-                seen.add(metric_name)
-                metric_names.append(metric_name)
-
+def _kpi_matrix_rows(reports: list[dict], year: str = "current") -> list[dict]:
+    """One row per KPI ID × one column per company."""
+    by_company = [(report["name"], {r["kpi_id"]: r for r in report["kpis"]}) for report in reports]
     rows = []
-    for metric_name in sorted(metric_names):
-        holders = [company for company, found in by_company if metric_name in found]
-        if len(holders) < 2:
-            continue
-        row = {"Metric": metric_name}
+    for kpi in KPI_CATALOG:
+        row = {"ID": kpi["id"], "KPI": kpi["name"], "Unit": kpi["required_unit"]}
         for company, found in by_company:
-            row[company] = _metric_cell(found.get(metric_name))
+            row[company] = _kpi_cell(found.get(kpi["id"]), year)
         rows.append(row)
     return rows
 
 
+
 def _merged_chat_context(reports: list[dict]):
-    metrics = []
+    kpis = []
     topic_index = []
     page_map = {}
     texts = []
@@ -319,15 +356,14 @@ def _merged_chat_context(reports: list[dict]):
                 "topic": f"{report['name']}: {entry.get('topic', '')}",
                 "pages": [remap[page] for page in entry.get("pages", []) if page in remap],
             })
-        for metric in report["metrics"]:
-            metrics.append(dict(metric, _company=report["name"]))
+        kpis.extend(report.get("kpis") or [])
         texts.append(f"\n\n===== {report['name']} =====\n\n{report.get('full_text') or ''}")
-    return metrics, topic_index, page_map, "\n".join(texts)
+    return kpis, topic_index, page_map, "\n".join(texts)
 
 
 def _find_existing_report(reports: list[dict], company_name: str, source_file: str):
     for report in reports:
-        if not report.get("metrics"):
+        if not report_ready(report):
             continue
         if source_file and report.get("source_file") == source_file:
             return report
@@ -509,8 +545,8 @@ def _run_next_inline_step(status_container=None):
         clear_pending_job()
         reports = load_reports()
         _sync_reports()
-        ready_count = sum(1 for report in reports if report.get("metrics"))
-        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced metrics."
+        ready_count = sum(1 for report in reports if report_ready(report))
+        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced KPIs."
         save_job(
             status="completed",
             progress=1.0,
@@ -553,7 +589,7 @@ def _run_next_inline_step(status_container=None):
     if proc.returncode != 0:
         st.session_state.pop("_inline_auto_continue", None)
         reports = st.session_state.get("reports", [])
-        ready_count = sum(1 for r in reports if r.get("metrics"))
+        ready_count = sum(1 for r in reports if report_ready(r))
         save_job(
             status="failed",
             message=(
@@ -570,8 +606,8 @@ def _run_next_inline_step(status_container=None):
         st.session_state.pop("_inline_auto_continue", None)
         clear_pending_job()
         reports = st.session_state.get("reports", [])
-        ready_count = sum(1 for r in reports if r.get("metrics"))
-        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced metrics."
+        ready_count = sum(1 for r in reports if report_ready(r))
+        notice = f"Finished. {ready_count} of {len(reports)} saved reports produced KPIs."
         save_job(
             status="completed",
             progress=1.0,
@@ -591,33 +627,30 @@ def render_results_overview(reports: list[dict]):
 
     rows = []
     for report in reports:
-        counts = _coverage_counts(report["metrics"])
-        if report.get("error"):
-            status = "Failed"
-        elif report.get("metrics"):
-            status = "Ready"
-        else:
-            status = "No metrics"
+        counts = _coverage_counts(report.get("kpis") or [])
         rows.append({
             "Company": report["name"],
             "File": report.get("source_file", ""),
-            "Metrics": counts["metrics"],
-            "BRSR principles": counts["brsr"],
-            "Environmental": counts["Environmental"],
-            "Social": counts["Social"],
-            "Governance": counts["Governance"],
-            "Status": status,
+            "KPIs disclosed": counts["disclosed"],
+            "Derived": str(counts["derived"]),
+            **{cat: counts[cat] for cat in CATEGORIES},
+            "Status": _report_status(report),
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    if any(is_legacy_report(report) for report in reports):
+        st.info(
+            "Reports marked **Needs re-extraction** were saved before the fixed-KPI format. "
+            "Upload those PDFs again to extract the KPIs."
+        )
 
-    ready = [report for report in reports if report.get("metrics")]
+    ready = [report for report in reports if report_ready(report)]
     download_col, zip_col, clear_col = st.columns(3)
     with download_col:
         if ready:
             st.download_button(
                 "Download combined CSV",
-                _combined_metrics_csv(ready),
-                file_name="esg_all_companies.csv",
+                _combined_kpi_csv(ready),
+                file_name="esg_kpis_all_companies.csv",
                 mime="text/csv",
                 key="dl_combined_csv",
             )
@@ -626,7 +659,7 @@ def render_results_overview(reports: list[dict]):
             st.download_button(
                 "Download all CSVs (zip)",
                 _reports_csv_zip(ready),
-                file_name="esg_company_csvs.zip",
+                file_name="esg_kpi_csvs.zip",
                 mime="application/zip",
                 key="dl_csv_zip",
             )
@@ -642,14 +675,14 @@ def render_results_overview(reports: list[dict]):
             for index, report in enumerate(ready):
                 st.download_button(
                     f"CSV — {report['name']}",
-                    _metrics_frame(report["metrics"]).to_csv(index=False),
-                    file_name=f"{_safe_download_stem(report['name'])}.csv",
+                    kpi_frame(report["kpis"]).to_csv(index=False),
+                    file_name=f"{_safe_download_stem(report['name'])}_kpis.csv",
                     mime="text/csv",
                     key=f"dl_one_{index}_{_safe_download_stem(report['name'])}",
                 )
 
     for report in reports:
-        if report.get("metrics"):
+        if report_ready(report) or is_legacy_report(report):
             continue
         with st.expander(f"{report['name']} — nothing extracted"):
             if report.get("error"):
@@ -659,77 +692,53 @@ def render_results_overview(reports: list[dict]):
 
 
 # ---------------------------------------------------------------------
-# Detail view: grouped-by-principle table + AI summary
+# Detail view: the KPIs by category + an AI summary
 # ---------------------------------------------------------------------
-def render_detail_tab(name: str, data: dict):
-    metrics = data["metrics"]
-    df = _safe_metrics_df(metrics)
+DETAIL_COLUMNS = ["ID", "KPI", "Current FY", "Current", "Previous FY", "Previous", "YoY %", "Unit", "Status", "Pages"]
 
-    st.subheader(f"{name} — {len(df)} metrics extracted")
+
+def render_detail_tab(name: str, data: dict):
+    kpis = data["kpis"]
+    df = kpi_frame(kpis)
+    cov = kpi_coverage(kpis)
+
+    st.subheader(f"{name} — {cov['disclosed']}/{cov['total']} KPIs disclosed")
+    st.caption(
+        f"{cov['derived']} of these are **derived** (unit-converted or computed from figures the report "
+        "states); the Derivation column shows the formula. Everything else is copied as printed."
+    )
 
     col1, col2 = st.columns(2)
     with col1:
-        st.download_button("Download CSV", df.to_csv(index=False), file_name=f"{name}_metrics.csv", key=f"dl_csv_{name}")
+        st.download_button("Download CSV", df.to_csv(index=False), file_name=f"{name}_kpis.csv", key=f"dl_csv_{name}")
     with col2:
-        st.download_button("Download JSON", json.dumps(metrics, indent=2), file_name=f"{name}_metrics.json", key=f"dl_json_{name}")
+        st.download_button("Download JSON", json.dumps(kpis, indent=2), file_name=f"{name}_kpis.json", key=f"dl_json_{name}")
 
-    st.subheader("BRSR Core — 9 Principle Coverage")
-    coverage = brsr_coverage_report(metrics)
-    cov_df = pd.DataFrame([
-        {"Principle": num, "Description": info["principle"], "Disclosed?": "✅ Yes" if info["covered"] else "❌ Gap"}
-        for num, info in coverage.items()
-    ])
-    st.dataframe(cov_df, width='stretch', hide_index=True)
+    for cat in CATEGORIES:
+        cat_df = df[df["Category"] == cat]
+        n = cov["by_category"][cat]
+        with st.expander(f"{cat} — {n}/{cov['category_totals'][cat]} disclosed", expanded=True):
+            st.dataframe(cat_df[DETAIL_COLUMNS], width="stretch", hide_index=True)
 
-    gaps = [c for c in coverage.values() if not c["covered"]]
-    if gaps:
-        st.warning(f"⚠️ {len(gaps)} of 9 BRSR Core principles have no disclosed metrics — potential compliance gaps.")
-    else:
-        st.success("✅ All 9 BRSR Core principles have at least one disclosed metric.")
+    derived_rows = df[df["Derivation"] != ""]
+    if not derived_rows.empty:
+        with st.expander(f"How derived values were computed ({len(derived_rows)})"):
+            for _, row in derived_rows.iterrows():
+                st.markdown(f"**{row['ID']} {row['KPI']}** — {row['Derivation']}")
 
-    if "category" in df.columns:
-        st.subheader("Metrics by Category")
-        cat_counts = df["category"].value_counts()
-        if PLOTLY_AVAILABLE:
-            # Using Plotly here instead of st.bar_chart on purpose: this
-            # chart renders once per company, and both companies' Detail
-            # tabs run in the same Streamlit pass (tabs don't actually
-            # skip execution for hidden tabs). st.bar_chart in this
-            # Streamlit version has no "key" argument to disambiguate two
-            # identical-looking calls, which is exactly what caused the
-            # earlier plotly_chart crash — Plotly's chart supports "key"
-            # here, so it's the safer choice for anything rendered twice.
-            fig = px.bar(
-                x=cat_counts.index, y=cat_counts.values,
-                labels={"x": "", "y": "Count"},
-                color=cat_counts.index,
-                color_discrete_map={"Environmental": REPORT_PALETTE["environmental"], "Social": REPORT_PALETTE["social"], "Governance": REPORT_PALETTE["governance"]},
-            )
-            fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=10, b=10), height=280)
-            st.plotly_chart(fig, width='stretch', key=f"detail_bar_{name}")
-        else:
-            st.bar_chart(cat_counts)
-
-    st.subheader("Metrics grouped by BRSR Principle")
-    for num, principle_name in BRSR_PRINCIPLES.items():
-        principle_metrics = [m for m in metrics if m.get("brsr_principle") == num]
-        if not principle_metrics:
-            continue
-        with st.expander(f"Principle {num} — {principle_name} ({len(principle_metrics)} metrics)"):
-            for m in principle_metrics:
-                st.markdown(
-                    f"**{m.get('metric_name', '?')}**: {m.get('value', '?')} {m.get('unit', '')} "
-                    f"({m.get('year', 'n/a')}) — *{m.get('gri_code') or 'no GRI code'}* — "
-                    f"{m.get('source_context', '')}"
-                )
+    if cov["missing"]:
+        st.warning(
+            "Not disclosed: " + ", ".join(f"{r['kpi_id']} {r['kpi_name']}" for r in cov["missing"])
+        )
 
     st.subheader("🤖 AI Summary")
     if st.button("Generate summary", key=f"summary_btn_{name}"):
         with st.spinner("Writing summary..."):
-            data["summary"] = generate_summary(company_name=name, metrics=metrics)
+            data["summary"] = generate_summary(company_name=name, kpis=kpis)
         _persist_reports(st.session_state["reports"])
     if data.get("summary"):
         st.markdown(data["summary"])
+
 
 
 # ---------------------------------------------------------------------
@@ -738,7 +747,7 @@ def render_detail_tab(name: str, data: dict):
 def render_chat_tab(name: str, data: dict):
     st.subheader(f"💬 Ask about {name}")
     st.caption(
-        "Answers start from the extracted metrics table (fast). If that's "
+        "Answers start from the extracted KPI table (fast). If that's "
         "not enough — e.g. asking about a program or policy, not just a "
         "number — it looks it up in the topic index built at upload time, "
         "and only does a full report scan as a last resort."
@@ -749,7 +758,7 @@ def render_chat_tab(name: str, data: dict):
             st.write(turn["question"])
         with st.chat_message("assistant"):
             st.write(turn["answer"])
-            st.caption(f"Answered from: {['metrics table', 'topic index lookup', 'full report scan'][turn['tier'] - 1]}")
+            st.caption(f"Answered from: {['KPI table', 'topic index lookup', 'full report scan'][turn['tier'] - 1]}")
 
     question = st.chat_input(f"Ask something about {name}...", key=f"chat_input_{name}")
     if question:
@@ -764,7 +773,7 @@ def render_chat_tab(name: str, data: dict):
         result = answer_chat_question(
             question=question,
             company_name=name,
-            metrics=data["metrics"],
+            kpis=data["kpis"],
             topic_index=data["topic_index"],
             page_map=data["page_map"],
             full_text=data["full_text"],
@@ -775,7 +784,7 @@ def render_chat_tab(name: str, data: dict):
 
         with st.chat_message("assistant"):
             st.write(result["answer"])
-            tier_label = ["metrics table", "topic index lookup", "full report scan"][result["tier"] - 1]
+            tier_label = ["KPI table", "topic index lookup", "full report scan"][result["tier"] - 1]
             st.caption(f"Answered from: {tier_label}")
             with st.expander("Debug: how this was answered"):
                 for d in result["debug"]:
@@ -787,112 +796,110 @@ def render_chat_tab(name: str, data: dict):
 
 
 # ---------------------------------------------------------------------
-# Report tab: selectable multi-page report (cover, E, S, G+gaps, AI
-# summary, raw data appendix), styled with the muted ESG palette.
+# Report tab: selectable multi-page report (cover, one page per KPI
+# category, AI summary, raw data appendix), styled with the muted palette.
 # ---------------------------------------------------------------------
 REPORT_PALETTE = {
-    "environmental": "#5B8C6E",
+    "environment": "#5B8C6E",
     "social": "#5B7C99",
     "governance": "#6B5B95",
+    "financial": "#8C6D46",
     "disclosed": "#6B9E78",
     "partial": "#C9A15A",
     "missing": "#B56B6B",
+    "neutral": "#9AA0A6",
     "bg": "#FAFAF8",
     "text": "#2B2B2B",
     "border": "#E0E0DD",
     "accent": "#2D6A4F",
 }
 
-
-def _safe_metrics_df(metrics: list[dict]) -> pd.DataFrame:
-    """
-    pd.DataFrame(metrics) directly can crash with a pyarrow ArrowInvalid
-    error if the "year" column mixes types — e.g. some metrics have a plain
-    int year (2024) and others have a fiscal-year string ("2025-26"), which
-    is normal for Indian BRSR reports. extractor.py now normalizes year to
-    a string at extraction time, but this is a defensive second layer for
-    any already-loaded session data from before that fix, or any other
-    insertion path — always coerce year to string right before display.
-    """
-    df = pd.DataFrame(metrics)
-    if "year" in df.columns:
-        df["year"] = df["year"].astype(str).replace("None", "")
-    return df
+STATUS_COLORS = {
+    "Reported": REPORT_PALETTE["disclosed"],
+    "Derived": REPORT_PALETTE["partial"],
+    "Reported (unit differs)": REPORT_PALETTE["neutral"],
+    "Not disclosed": REPORT_PALETTE["missing"],
+}
 
 
-def _top_numeric_metrics(metrics, category, n=10):
-    subset = [
-        m for m in metrics
-        if m.get("category") == category and isinstance(m.get("value"), (int, float))
-    ]
-    return sorted(subset, key=lambda m: m["value"], reverse=True)[:n]
+def _status_counts(kpis: list[dict]) -> dict:
+    counts = {label: 0 for label in STATUS_LABELS.values()}
+    for r in kpis:
+        counts[STATUS_LABELS.get(r.get("status"), "Not disclosed")] += 1
+    return counts
 
 
-def _chart_explanation(top_metrics, category):
-    """A short, deterministic (non-AI) one-liner under each chart — instant, free, no API call."""
-    if not top_metrics:
-        return f"No numeric {category.lower()} metrics were available to chart."
-    best = top_metrics[0]
-    year = f" ({best['year']})" if best.get("year") else ""
+def _yoy_rows(kpis: list[dict], category: str) -> list[dict]:
+    """KPIs in this category with a current AND previous number, for the YoY chart."""
+    rows = []
+    for r in kpis:
+        if r["category"] != category or not is_disclosed(r):
+            continue
+        change = yoy_change(r)
+        if change is None:
+            continue
+        direction = KPI_BY_ID[r["kpi_id"]].get("direction")
+        if direction == "higher":
+            verdict = "better" if change > 0 else "worse" if change < 0 else "flat"
+        elif direction == "lower":
+            verdict = "better" if change < 0 else "worse" if change > 0 else "flat"
+        else:
+            verdict = "neutral"
+        rows.append({"label": f"{r['kpi_id']} {r['kpi_name']}"[:45], "change": change, "verdict": verdict})
+    return sorted(rows, key=lambda x: x["change"])
+
+
+_VERDICT_COLORS = {
+    "better": REPORT_PALETTE["disclosed"],
+    "worse": REPORT_PALETTE["missing"],
+    "flat": REPORT_PALETTE["neutral"],
+    "neutral": REPORT_PALETTE["neutral"],
+}
+
+
+def _yoy_explanation(rows: list[dict], category: str) -> str:
+    if not rows:
+        return f"No {category.lower()} KPI has both a current and a previous-year number to compare."
+    better = sum(1 for r in rows if r["verdict"] == "better")
+    worse = sum(1 for r in rows if r["verdict"] == "worse")
     return (
-        f"The largest disclosed {category.lower()} figure is **{best.get('metric_name')}** "
-        f"at **{best.get('value')} {best.get('unit', '')}**{year}. "
-        f"{len(top_metrics)} numeric {category.lower()} metrics are charted here."
+        f"{len(rows)} {category.lower()} KPIs have both years. {better} moved in the better direction, "
+        f"{worse} in the worse direction (green = better, red = worse, grey = no preferred direction)."
     )
 
 
-def _plotly_category_chart(metrics, category, key_suffix=""):
-    """Interactive on-screen bar chart. Returns the top metrics used, for the explanation line."""
-    top = _top_numeric_metrics(metrics, category, n=10)
-    if not top or not PLOTLY_AVAILABLE:
-        return top
-    df = _safe_metrics_df(top).sort_values("value")
-    fig = px.bar(
-        df, x="value", y="metric_name", orientation="h",
-        color_discrete_sequence=[REPORT_PALETTE[category.lower()]],
-        labels={"value": "Value", "metric_name": ""}, text="unit",
-    )
+def _plotly_yoy_chart(rows, category, key_suffix=""):
+    if not rows or not PLOTLY_AVAILABLE:
+        return
+    fig = go.Figure(go.Bar(
+        x=[r["change"] for r in rows], y=[r["label"] for r in rows], orientation="h",
+        marker_color=[_VERDICT_COLORS[r["verdict"]] for r in rows],
+        text=[f"{r['change']:+.1f}%" for r in rows], textposition="outside",
+    ))
     fig.update_layout(
         plot_bgcolor=REPORT_PALETTE["bg"], paper_bgcolor=REPORT_PALETTE["bg"],
-        font_color=REPORT_PALETTE["text"], margin=dict(l=10, r=10, t=10, b=10),
-        height=max(280, 32 * len(df)),
-        xaxis=dict(gridcolor=REPORT_PALETTE["border"]),
+        font_color=REPORT_PALETTE["text"], margin=dict(l=10, r=40, t=10, b=10),
+        height=max(240, 34 * len(rows)),
+        xaxis=dict(gridcolor=REPORT_PALETTE["border"], title="Change vs previous year (%)"),
     )
-    st.plotly_chart(fig, width='stretch', key=f"chart_cat_{category}_{key_suffix}")
-    return top
+    st.plotly_chart(fig, width='stretch', key=f"chart_yoy_{category}_{key_suffix}")
 
 
-def _plotly_cover_donut(cat_counts, key_suffix=""):
+def _plotly_status_donut(kpis, key_suffix=""):
     if not PLOTLY_AVAILABLE:
         return
-    cats = ["Environmental", "Social", "Governance"]
-    vals = [int(cat_counts.get(c, 0)) for c in cats]
+    counts = _status_counts(kpis)
+    labels = [k for k, v in counts.items() if v]
     fig = go.Figure(data=[go.Pie(
-        labels=cats, values=vals, hole=0.55,
-        marker=dict(colors=[REPORT_PALETTE[c.lower()] for c in cats]),
+        labels=labels, values=[counts[k] for k in labels], hole=0.55,
+        marker=dict(colors=[STATUS_COLORS[k] for k in labels]), sort=False,
     )])
     fig.update_layout(
         paper_bgcolor=REPORT_PALETTE["bg"], font_color=REPORT_PALETTE["text"],
         margin=dict(l=10, r=10, t=10, b=10), height=300,
-        annotations=[dict(text="E / S / G", x=0.5, y=0.5, showarrow=False)],
+        annotations=[dict(text=f"{len(KPI_CATALOG)} KPIs", x=0.5, y=0.5, showarrow=False)],
     )
     st.plotly_chart(fig, width='stretch', key=f"chart_donut_{key_suffix}")
-
-
-def _plotly_gap_chart(coverage, key_suffix=""):
-    if not PLOTLY_AVAILABLE:
-        return
-    disclosed = sum(1 for c in coverage.values() if c["covered"])
-    missing = 9 - disclosed
-    fig = go.Figure(go.Bar(
-        x=["Disclosed", "Gap"], y=[disclosed, missing],
-        marker_color=[REPORT_PALETTE["disclosed"], REPORT_PALETTE["missing"]],
-    ))
-    fig.update_layout(
-        plot_bgcolor=REPORT_PALETTE["bg"], paper_bgcolor=REPORT_PALETTE["bg"],
-        font_color=REPORT_PALETTE["text"], margin=dict(l=10, r=10, t=10, b=10), height=280,
-    )
-    st.plotly_chart(fig, width='stretch', key=f"chart_gap_{key_suffix}")
 
 
 def _report_card(title: str, value: str, color: str, subtitle: str = ""):
@@ -913,162 +920,65 @@ def _report_card(title: str, value: str, color: str, subtitle: str = ""):
 
 def _report_page_cover(name: str, data: dict):
     p = REPORT_PALETTE
-    metrics = data["metrics"]
-    df = _safe_metrics_df(metrics)
-    coverage = brsr_coverage_report(metrics)
-    covered_count = sum(1 for c in coverage.values() if c["covered"])
-    cat_counts = df["category"].value_counts() if "category" in df.columns else pd.Series(dtype=int)
+    kpis = data["kpis"]
+    cov = kpi_coverage(kpis)
 
     st.markdown(
         f"""
         <div style="background:{p['bg']}; border:1px solid {p['border']}; border-radius:8px;
                     padding:32px; margin-bottom:20px;">
             <div style="font-size:14px; letter-spacing:0.08em; text-transform:uppercase;
-                        color:{p['accent']}; opacity:0.85;">ESG / BRSR Report Snapshot</div>
-            <div style="font-size:34px; font-weight:500; color:{p['text']}; margin-top:6px;">{name}</div>
+                        color:{p['accent']}; opacity:0.85;">ESG KPI Snapshot</div>
+            <div style="font-size:34px; font-weight:500; color:{p['text']}; margin-top:6px;">{_html_escape(name)}</div>
             <div style="font-size:14px; color:{p['text']}; opacity:0.6; margin-top:4px;">
-                {len(df)} metrics extracted &nbsp;•&nbsp; {covered_count}/9 BRSR Core principles disclosed
+                {cov['disclosed']}/{cov['total']} KPIs disclosed &nbsp;•&nbsp; {cov['derived']} derived
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        _report_card("Environmental", str(int(cat_counts.get("Environmental", 0))), p["environmental"], "metrics")
-    with c2:
-        _report_card("Social", str(int(cat_counts.get("Social", 0))), p["social"], "metrics")
-    with c3:
-        _report_card("Governance", str(int(cat_counts.get("Governance", 0))), p["governance"], "metrics")
-    with c4:
-        _report_card("BRSR Coverage", f"{covered_count}/9", p["accent"], "principles disclosed")
+    cols = st.columns(len(CATEGORIES))
+    for col, cat in zip(cols, CATEGORIES):
+        with col:
+            _report_card(cat, f"{cov['by_category'][cat]}/{cov['category_totals'][cat]}",
+                         p[cat.lower()], "KPIs disclosed")
 
     if PLOTLY_AVAILABLE:
         st.markdown("&nbsp;", unsafe_allow_html=True)
-        _plotly_cover_donut(cat_counts, key_suffix=name)
-        st.caption(
-            f"{len(df)} total metrics span the three ESG pillars — Environmental, Social, and "
-            f"Governance — with {covered_count} of 9 BRSR Core principles disclosed."
-        )
+        _plotly_status_donut(kpis, key_suffix=name)
+
+    if cov["missing"]:
+        st.markdown("**Not disclosed**")
+        st.markdown(", ".join(f"{r['kpi_id']} {r['kpi_name']}" for r in cov["missing"]))
 
 
-def _report_page_category(name: str, data: dict, category: str, color: str):
+def _report_page_category(name: str, data: dict, category: str):
     p = REPORT_PALETTE
-    metrics = [m for m in data["metrics"] if m.get("category") == category]
+    color = p[category.lower()]
+    kpis = [r for r in data["kpis"] if r["category"] == category]
+    disclosed = [r for r in kpis if is_disclosed(r)]
 
     st.markdown(
         f"""<div style="border-left:4px solid {color}; padding-left:14px; margin-bottom:16px;">
                 <span style="font-size:22px; font-weight:500; color:{p['text']};">{category}</span>
-                <span style="font-size:14px; color:{p['text']}; opacity:0.6;"> — {len(metrics)} metrics</span>
+                <span style="font-size:14px; color:{p['text']}; opacity:0.6;"> — {len(disclosed)}/{len(kpis)} KPIs disclosed</span>
             </div>""",
         unsafe_allow_html=True,
     )
 
-    if not metrics:
-        st.info(f"No {category.lower()} metrics were extracted for {name}.")
-        return
+    df = kpi_frame(kpis)
+    st.dataframe(df[DETAIL_COLUMNS], width="stretch", hide_index=True)
 
-    top = _plotly_category_chart(metrics, category, key_suffix=name)
-    if top:
-        st.caption(_chart_explanation(top, category))
+    rows = _yoy_rows(kpis, category)
+    _plotly_yoy_chart(rows, category, key_suffix=name)
+    st.caption(_yoy_explanation(rows, category))
 
-    principles_here = sorted({m.get("brsr_principle") for m in metrics if m.get("brsr_principle")})
-    for num in principles_here:
-        principle_name = BRSR_PRINCIPLES.get(num, f"Principle {num}")
-        group = [m for m in metrics if m.get("brsr_principle") == num]
-        with st.expander(f"Principle {num} — {principle_name} ({len(group)} metrics)", expanded=False):
-            for m in group:
-                st.markdown(
-                    f"**{m.get('metric_name', '?')}**: {m.get('value', '?')} {m.get('unit', '')} "
-                    f"({m.get('year', 'n/a')}) — *{m.get('gri_code') or 'no GRI code'}*"
-                )
-
-    uncategorized = [m for m in metrics if not m.get("brsr_principle")]
-    if uncategorized:
-        with st.expander(f"Not mapped to a principle ({len(uncategorized)} metrics)", expanded=False):
-            for m in uncategorized:
-                st.markdown(f"**{m.get('metric_name', '?')}**: {m.get('value', '?')} {m.get('unit', '')}")
-
-
-def _report_page_governance_gaps(name: str, data: dict):
-    p = REPORT_PALETTE
-    metrics = data["metrics"]
-    coverage = brsr_coverage_report(metrics)
-
-    st.markdown(
-        f"""<div style="border-left:4px solid {p['governance']}; padding-left:14px; margin-bottom:16px;">
-                <span style="font-size:22px; font-weight:500; color:{p['text']};">Governance & BRSR Coverage Gaps</span>
-            </div>""",
-        unsafe_allow_html=True,
-    )
-
-    gov_metrics = [m for m in metrics if m.get("category") == "Governance"]
-    st.caption(f"{len(gov_metrics)} governance metrics extracted.")
-    for m in gov_metrics:
-        st.markdown(
-            f"**{m.get('metric_name', '?')}**: {m.get('value', '?')} {m.get('unit', '')} ({m.get('year', 'n/a')})"
-        )
-
-    if PLOTLY_AVAILABLE:
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        _plotly_gap_chart(coverage, key_suffix=name)
-        disclosed_n = sum(1 for c in coverage.values() if c["covered"])
-        st.caption(f"{disclosed_n} of 9 BRSR Core principles have at least one disclosed metric; {9 - disclosed_n} show no disclosure at all.")
-
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    st.markdown(
-        f"""<div style="font-size:16px; font-weight:500; color:{p['text']}; margin-bottom:8px;">
-                BRSR Core — 9 Principle Coverage
-            </div>""",
-        unsafe_allow_html=True,
-    )
-    for num, info in coverage.items():
-        status_color = p["disclosed"] if info["covered"] else p["missing"]
-        status_label = "✅ Disclosed" if info["covered"] else "❌ Gap"
-        st.markdown(
-            f"""
-            <div style="display:flex; justify-content:space-between; align-items:center;
-                        border:1px solid {p['border']}; border-radius:6px; padding:10px 16px; margin-bottom:6px;">
-                <span style="color:{p['text']};">Principle {num} — {info['principle']}</span>
-                <span style="color:{status_color}; font-weight:500;">{status_label}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    gaps = [c for c in coverage.values() if not c["covered"]]
-    if gaps:
-        st.warning(f"⚠️ {len(gaps)} of 9 BRSR Core principles have no disclosed metrics.")
-    else:
-        st.success("✅ All 9 BRSR Core principles have at least one disclosed metric.")
-
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    st.markdown(
-        f"""<div style="font-size:16px; font-weight:500; color:{p['text']}; margin-bottom:4px;">
-                🚩 Red Flags — commonly-mandatory disclosures found missing
-            </div>""",
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "A short, deliberately conservative checklist (not the full official Essential-indicator "
-        "list — that's a separate, dedicated project) — flags a small set of disclosures almost "
-        "every listed company is expected to report, checked against both the extracted metrics "
-        "AND the topic index, so something only discussed in prose still counts as present."
-    )
-    red_flags = identify_red_flags(metrics, data["topic_index"])
-    if red_flags:
-        for flag in red_flags:
-            st.markdown(
-                f"""<div style="border:1px solid {p['missing']}; background:#fdf2f2; border-radius:6px;
-                            padding:10px 16px; margin-bottom:6px;">
-                        <span style="color:{p['missing']}; font-weight:600;">Missing:</span>
-                        <span style="color:{p['text']};"> {_html_escape(flag['indicator'])} (Principle {flag['principle']} — {_html_escape(flag['principle_name'])})</span>
-                    </div>""",
-                unsafe_allow_html=True,
-            )
-    else:
-        st.success("✅ No red flags — every commonly-mandatory indicator on this checklist was found somewhere in the report.")
+    derived = [r for r in kpis if r.get("derivation")]
+    if derived:
+        with st.expander(f"Derived values ({len(derived)})"):
+            for r in derived:
+                st.markdown(f"**{r['kpi_id']} {r['kpi_name']}** — {r['derivation']}")
 
 
 def _report_page_ai_summary(name: str, data: dict):
@@ -1081,7 +991,7 @@ def _report_page_ai_summary(name: str, data: dict):
     )
     if st.button("Generate summary", key=f"report_summary_btn_{name}"):
         with st.spinner("Writing summary..."):
-            data["summary"] = generate_summary(company_name=name, metrics=data["metrics"])
+            data["summary"] = generate_summary(company_name=name, kpis=data["kpis"])
         _persist_reports(st.session_state["reports"])
 
     if data.get("summary"):
@@ -1092,8 +1002,8 @@ def _report_page_ai_summary(name: str, data: dict):
 
 def _report_page_appendix(name: str, data: dict):
     p = REPORT_PALETTE
-    metrics = data["metrics"]
-    df = _safe_metrics_df(metrics)
+    kpis = data["kpis"]
+    df = kpi_frame(kpis)
     st.markdown(
         f"""<div style="border-left:4px solid {p['text']}; padding-left:14px; margin-bottom:16px;">
                 <span style="font-size:22px; font-weight:500; color:{p['text']};">Raw Data Appendix</span>
@@ -1103,90 +1013,72 @@ def _report_page_appendix(name: str, data: dict):
     st.dataframe(df, width='stretch', hide_index=True)
     col1, col2 = st.columns(2)
     with col1:
-        st.download_button("Download CSV", df.to_csv(index=False), file_name=f"{name}_report.csv", key=f"report_dl_csv_{name}")
+        st.download_button("Download CSV", df.to_csv(index=False), file_name=f"{name}_kpis.csv", key=f"report_dl_csv_{name}")
     with col2:
-        st.download_button("Download JSON", json.dumps(metrics, indent=2), file_name=f"{name}_report.json", key=f"report_dl_json_{name}")
+        st.download_button("Download JSON", json.dumps(kpis, indent=2), file_name=f"{name}_kpis.json", key=f"report_dl_json_{name}")
 
 
 def _safe_pdf_text(text) -> str:
     """fpdf2's built-in fonts only support Latin-1; swap anything else out
     rather than crash the whole PDF build over one unusual character."""
-    return str(text).encode("latin-1", "replace").decode("latin-1")
+    return str(text).replace("—", "-").replace("·", "|").replace("×", "x").encode("latin-1", "replace").decode("latin-1")
 
 
-def _mpl_bar_chart(top_metrics, category):
-    if not MATPLOTLIB_AVAILABLE or not top_metrics:
-        return None
-    ordered = list(reversed(top_metrics))
-    names = [str(m.get("metric_name", "?"))[:40] for m in ordered]
-    values = [m["value"] for m in ordered]
-    fig, ax = plt.subplots(figsize=(6.2, max(2, 0.4 * len(names))))
-    ax.barh(names, values, color=REPORT_PALETTE[category.lower()])
+def _mpl_png(fig):
     fig.patch.set_facecolor(REPORT_PALETTE["bg"])
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _mpl_yoy_chart(rows):
+    if not MATPLOTLIB_AVAILABLE or not rows:
+        return None
+    fig, ax = plt.subplots(figsize=(6.2, max(2, 0.4 * len(rows))))
+    ax.barh([r["label"] for r in rows], [r["change"] for r in rows],
+            color=[_VERDICT_COLORS[r["verdict"]] for r in rows])
+    ax.axvline(0, color=REPORT_PALETTE["border"], linewidth=1)
+    ax.set_xlabel("Change vs previous year (%)", color=REPORT_PALETTE["text"], fontsize=8)
     ax.set_facecolor(REPORT_PALETTE["bg"])
     ax.tick_params(colors=REPORT_PALETTE["text"], labelsize=8)
     for spine in ax.spines.values():
         spine.set_color(REPORT_PALETTE["border"])
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+    return _mpl_png(fig)
 
 
-def _mpl_donut(cat_counts):
+def _mpl_status_donut(kpis):
     if not MATPLOTLIB_AVAILABLE:
         return None
-    cats = ["Environmental", "Social", "Governance"]
-    vals = [int(cat_counts.get(c, 0)) for c in cats]
+    counts = _status_counts(kpis)
+    labels = [k for k, v in counts.items() if v]
     fig, ax = plt.subplots(figsize=(4, 4))
     ax.pie(
-        vals, labels=cats, colors=[REPORT_PALETTE[c.lower()] for c in cats],
-        wedgeprops=dict(width=0.45), textprops={"color": REPORT_PALETTE["text"]},
+        [counts[k] for k in labels], labels=labels, colors=[STATUS_COLORS[k] for k in labels],
+        wedgeprops=dict(width=0.45), textprops={"color": REPORT_PALETTE["text"], "fontsize": 8},
     )
-    fig.patch.set_facecolor(REPORT_PALETTE["bg"])
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-def _mpl_gap_bar(coverage):
-    if not MATPLOTLIB_AVAILABLE:
-        return None
-    disclosed = sum(1 for c in coverage.values() if c["covered"])
-    missing = 9 - disclosed
-    fig, ax = plt.subplots(figsize=(4, 3))
-    ax.bar(["Disclosed", "Gap"], [disclosed, missing], color=[REPORT_PALETTE["disclosed"], REPORT_PALETTE["missing"]])
-    fig.patch.set_facecolor(REPORT_PALETTE["bg"])
-    ax.set_facecolor(REPORT_PALETTE["bg"])
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
-    plt.close(fig)
-    buf.seek(0)
-    return buf
+    return _mpl_png(fig)
 
 
 def build_report_pdf(name: str, data: dict, selected_pages: list) -> bytes | None:
     """Assembles the selected report sections into a downloadable PDF —
-    same charts and colors as the on-screen version, rendered statically
-    via matplotlib since the PDF can't be interactive."""
+    same content and colors as the on-screen version, with static charts."""
     if not FPDF_AVAILABLE:
         return None
 
-    metrics = data["metrics"]
-    df = _safe_metrics_df(metrics)
-    coverage = brsr_coverage_report(metrics)
-    covered_count = sum(1 for c in coverage.values() if c["covered"])
-    cat_counts = df["category"].value_counts() if "category" in df.columns else pd.Series(dtype=int)
+    kpis = data["kpis"]
+    cov = kpi_coverage(kpis)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     tmpdir = tempfile.mkdtemp()
+
+    def _para(w, h, text):
+        # fpdf2 leaves the cursor at the right edge after multi_cell by
+        # default, so the next one would have no width; return to the margin.
+        pdf.multi_cell(w, h, text, new_x="LMARGIN", new_y="NEXT")
 
     def add_image(buf, w=170):
         if buf is None:
@@ -1199,43 +1091,46 @@ def build_report_pdf(name: str, data: dict, selected_pages: list) -> bytes | Non
     if "Cover / Snapshot" in selected_pages:
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 20)
-        pdf.cell(0, 12, _safe_pdf_text(f"{name} — ESG / BRSR Report"), ln=True)
+        pdf.cell(0, 12, _safe_pdf_text(f"{name} - ESG KPI Report"), ln=True)
         pdf.set_font("Helvetica", "", 11)
-        pdf.cell(0, 8, _safe_pdf_text(f"{len(df)} metrics extracted | {covered_count}/9 BRSR Core principles disclosed"), ln=True)
+        pdf.cell(0, 8, _safe_pdf_text(f"{cov['disclosed']}/{cov['total']} KPIs disclosed | {cov['derived']} derived"), ln=True)
+        for cat in CATEGORIES:
+            pdf.cell(0, 6, _safe_pdf_text(f"{cat}: {cov['by_category'][cat]}/{cov['category_totals'][cat]}"), ln=True)
         pdf.ln(4)
-        add_image(_mpl_donut(cat_counts), w=100)
+        add_image(_mpl_status_donut(kpis), w=100)
+        if cov["missing"]:
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(0, 8, "Not disclosed", ln=True)
+            pdf.set_font("Helvetica", "", 9)
+            _para(0, 5, _safe_pdf_text(", ".join(f"{r['kpi_id']} {r['kpi_name']}" for r in cov["missing"])))
 
-    for category in ["Environmental", "Social"]:
-        if category not in selected_pages:
+    for cat in CATEGORIES:
+        if cat not in selected_pages:
             continue
-        top = _top_numeric_metrics(metrics, category, n=10)
+        cat_kpis = [r for r in kpis if r["category"] == cat]
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, _safe_pdf_text(category), ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, _safe_pdf_text(_chart_explanation(top, category)))
-        pdf.ln(2)
-        add_image(_mpl_bar_chart(top, category))
-
-    if "Governance & Gaps" in selected_pages:
-        top = _top_numeric_metrics(metrics, "Governance", n=10)
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "Governance", ln=True)
-        pdf.set_font("Helvetica", "", 10)
-        pdf.multi_cell(0, 6, _safe_pdf_text(_chart_explanation(top, "Governance")))
-        pdf.ln(2)
-        add_image(_mpl_bar_chart(top, "Governance"))
-
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 16)
-        pdf.cell(0, 10, "BRSR Core Gap Analysis", ln=True)
-        add_image(_mpl_gap_bar(coverage), w=100)
-        pdf.ln(2)
-        pdf.set_font("Helvetica", "", 10)
-        for num, info in coverage.items():
-            status = "Disclosed" if info["covered"] else "GAP — not disclosed"
-            pdf.multi_cell(0, 6, _safe_pdf_text(f"Principle {num} — {info['principle']}: {status}"))
+        pdf.cell(0, 10, _safe_pdf_text(cat), ln=True)
+        for r in cat_kpis:
+            cur, prev = r["current"], r["previous"]
+            pdf.set_font("Helvetica", "B", 9)
+            _para(0, 5, _safe_pdf_text(f"{r['kpi_id']} {r['kpi_name']}  [{STATUS_LABELS.get(r['status'], r['status'])}]"))
+            pdf.set_font("Helvetica", "", 9)
+            if is_disclosed(r):
+                line = (
+                    f"   {cur.get('fy') or 'Current'}: {format_year(cur) or '-'}   |   "
+                    f"{prev.get('fy') or 'Previous'}: {format_year(prev) or '-'}   ({_kpi_unit(r)})"
+                )
+                _para(0, 5, _safe_pdf_text(line))
+                if r.get("derivation"):
+                    pdf.set_font("Helvetica", "I", 8)
+                    _para(0, 4, _safe_pdf_text(f"   Derived: {r['derivation']}"))
+        rows = _yoy_rows(cat_kpis, cat)
+        if rows:
+            pdf.ln(3)
+            pdf.set_font("Helvetica", "", 10)
+            _para(0, 6, _safe_pdf_text(_yoy_explanation(rows, cat)))
+            add_image(_mpl_yoy_chart(rows))
 
     if "AI Summary" in selected_pages:
         pdf.add_page()
@@ -1243,7 +1138,7 @@ def build_report_pdf(name: str, data: dict, selected_pages: list) -> bytes | Non
         pdf.cell(0, 10, "Executive Summary", ln=True)
         pdf.set_font("Helvetica", "", 10)
         summary = data.get("summary")
-        pdf.multi_cell(
+        _para(
             0, 6,
             _safe_pdf_text(summary) if summary else
             "No AI summary was generated for this report. Generate it in the app's "
@@ -1260,9 +1155,7 @@ def build_report_pdf(name: str, data: dict, selected_pages: list) -> bytes | Non
 
 REPORT_PAGES = {
     "Cover / Snapshot": _report_page_cover,
-    "Environmental": lambda nm, d: _report_page_category(nm, d, "Environmental", REPORT_PALETTE["environmental"]),
-    "Social": lambda nm, d: _report_page_category(nm, d, "Social", REPORT_PALETTE["social"]),
-    "Governance & Gaps": _report_page_governance_gaps,
+    **{cat: (lambda c: (lambda nm, d: _report_page_category(nm, d, c)))(cat) for cat in CATEGORIES},
     "AI Summary": _report_page_ai_summary,
     "Raw Data Appendix": _report_page_appendix,
 }
@@ -1270,16 +1163,13 @@ REPORT_PAGES = {
 
 # ---------------------------------------------------------------------
 # Styled HTML executive report — a separate download option alongside
-# the chart-based PDF above. Real .html file, no new dependencies, no
-# PDF-rendering library needed. Open the file in a browser and use
-# "Print -> Save as PDF" for an actual PDF, using software already on
-# any machine — this avoids installing weasyprint/wkhtmltopdf, which
-# are known to be genuinely painful on Windows.
+# the chart-based PDF above. Open the file in a browser and use
+# "Print -> Save as PDF" for an actual PDF.
 # ---------------------------------------------------------------------
 HTML_PALETTE = {
     "forest": "#0d3b2e",
     "sage": "#6b9080",
-    "cream": "#f4f6f0",   # corrected from the sample's invalid 7-char hex
+    "cream": "#f4f6f0",
     "card": "#ffffff",
     "border": "#e2e8f0",
     "win_bg": "#dcfce7", "win_text": "#15803d",
@@ -1287,22 +1177,24 @@ HTML_PALETTE = {
     "bad_bg": "#fee2e2", "bad_text": "#b91c1c",
 }
 
-# Common ESG metric-name keywords -> whether a HIGHER or LOWER value is
-# better. This is a deliberately simple, transparent lookup — not an AI
-# judgment call — so "who wins" is always explainable in an interview,
-# not a black box. Metrics that don't match any keyword are marked
-# direction-unknown rather than guessed.
-_LOWER_IS_BETTER_KEYWORDS = ["emission", "waste", "water consum", "water withdraw", "energy consum", "incident", "complaint", "turnover", "grievance"]
-_HIGHER_IS_BETTER_KEYWORDS = ["renewable", "recycl", "diversity", "women", "independent", "training", "wellbeing", "well-being", "coverage", "disclosed"]
-
-
-def _metric_direction(metric_name: str):
-    name_lower = (metric_name or "").lower()
-    if any(k in name_lower for k in _LOWER_IS_BETTER_KEYWORDS):
-        return "lower"
-    if any(k in name_lower for k in _HIGHER_IS_BETTER_KEYWORDS):
-        return "higher"
-    return None  # direction genuinely unclear for this metric name
+_HTML_STYLE = """
+* {{ box-sizing: border-box; }}
+body {{ font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; color: {forest}; background: {cream}; font-size: 14px; line-height: 1.5; margin: 0; padding: 24px; }}
+.header-card {{ background: linear-gradient(135deg, {forest} 0%, #1e4d3e 60%, {sage} 100%); color: #fff; padding: 24px; border-radius: 10px; margin-bottom: 20px; }}
+.header-title {{ font-size: 24px; font-weight: 800; margin: 0 0 4px 0; }}
+.header-meta {{ font-size: 12px; color: #e2e8f0; }}
+.card {{ background: {card}; border: 1px solid {border}; border-radius: 10px; padding: 18px; margin-bottom: 18px; overflow-x: auto; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th {{ background: {forest}; color: #fff; font-size: 11px; text-transform: uppercase; padding: 8px 10px; text-align: left; }}
+td {{ padding: 8px 10px; border-bottom: 1px solid #f1f5f9; font-size: 13px; vertical-align: top; }}
+td.sub {{ font-size: 11px; color: #64748b; }}
+.pill {{ padding: 2px 10px; border-radius: 12px; font-weight: 700; font-size: 11px; white-space: nowrap; }}
+.pill-win {{ background: {win_bg}; color: {win_text}; }}
+.pill-warn {{ background: {warn_bg}; color: {warn_text}; }}
+.pill-bad {{ background: {bad_bg}; color: {bad_text}; }}
+h2 {{ font-size: 16px; margin-top: 0; }}
+@media print {{ body {{ background: #fff; }} }}
+"""
 
 
 def _html_escape(text) -> str:
@@ -1311,147 +1203,143 @@ def _html_escape(text) -> str:
     )
 
 
+def _status_pill(status: str) -> str:
+    label = STATUS_LABELS.get(status, status or "")
+    css = {"reported": "pill-win", "derived": "pill-warn"}.get(status, "pill-bad")
+    return f'<span class="pill {css}">{_html_escape(label)}</span>'
+
+
+def _html_year(slot: dict) -> str:
+    text = format_year(slot)
+    if not text:
+        return "—"
+    fy = slot.get("fy")
+    return _html_escape(text) + (f'<br><span style="font-size:11px;color:#64748b;">{_html_escape(fy)}</span>' if fy else "")
+
+
 def _build_executive_html(name: str, data: dict) -> str:
-    """Single-company styled HTML executive report."""
-    metrics = data["metrics"]
-    coverage = brsr_coverage_report(metrics)
-    covered_count = sum(1 for c in coverage.values() if c["covered"])
+    """Single-company styled HTML KPI report."""
+    kpis = data["kpis"]
+    cov = kpi_coverage(kpis)
     p = HTML_PALETTE
 
-    rows_html = ""
-    for m in metrics[:60]:  # keep the file a reasonable size
-        assurance = m.get("assurance_level")
-        assurance_pill = (
-            f'<span class="pill pill-win">{_html_escape(assurance)}</span>' if assurance == "Reasonable Assurance"
-            else f'<span class="pill pill-warn">{_html_escape(assurance)}</span>' if assurance == "Limited Assurance"
-            else f'<span class="pill pill-bad">Unassured</span>' if assurance == "Unassured"
-            else "—"
-        )
-        rows_html += f"""<tr>
-            <td><strong>{_html_escape(m.get('metric_name', '?'))}</strong></td>
-            <td>{_html_escape(m.get('value', 'Not Disclosed'))} {_html_escape(m.get('unit', ''))}</td>
-            <td>{_html_escape(m.get('year', ''))}</td>
-            <td>{_html_escape(m.get('gri_code') or '—')}</td>
-            <td>{_html_escape(m.get('brsr_principle') or '—')}</td>
-            <td>{assurance_pill}</td>
-        </tr>"""
+    sections = ""
+    for cat in CATEGORIES:
+        rows_html = ""
+        for r in [r for r in kpis if r["category"] == cat]:
+            change = yoy_change(r)
+            rows_html += f"""<tr>
+                <td><strong>{_html_escape(r['kpi_id'])}</strong></td>
+                <td>{_html_escape(r['kpi_name'])}<br><span style="font-size:11px;color:#64748b;">{_html_escape(_kpi_unit(r))}</span></td>
+                <td>{_html_year(r['current'])}</td>
+                <td>{_html_year(r['previous'])}</td>
+                <td>{'—' if change is None else f'{change:+.1f}%'}</td>
+                <td>{_status_pill(r['status'])}</td>
+            </tr>"""
+            if r.get("derivation"):
+                rows_html += f'<tr><td></td><td class="sub" colspan="5">Derived: {_html_escape(r["derivation"])}</td></tr>'
+        sections += f"""<div class="card">
+  <h2>{cat} — {cov['by_category'][cat]}/{cov['category_totals'][cat]} disclosed</h2>
+  <table><thead><tr><th>ID</th><th>KPI</th><th>Current</th><th>Previous</th><th>YoY</th><th>Status</th></tr></thead>
+  <tbody>{rows_html}</tbody></table>
+</div>"""
 
     gap_rows = "".join(
-        f'<li>Principle {num}: {_html_escape(info["principle"])}</li>'
-        for num, info in coverage.items() if not info["covered"]
-    ) or "<li>No gaps — all 9 principles have at least one disclosed metric.</li>"
+        f"<li>{_html_escape(r['kpi_id'])} {_html_escape(r['kpi_name'])}</li>" for r in cov["missing"]
+    ) or "<li>None — every KPI has a disclosed value.</li>"
 
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>{_html_escape(name)} — ESG Executive Report</title>
-<style>
-* {{ box-sizing: border-box; }}
-body {{ font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; color: {p['forest']}; background: {p['cream']}; font-size: 14px; line-height: 1.5; margin: 0; padding: 24px; }}
-.header-card {{ background: linear-gradient(135deg, {p['forest']} 0%, #1e4d3e 60%, {p['sage']} 100%); color: #fff; padding: 24px; border-radius: 10px; margin-bottom: 20px; }}
-.header-title {{ font-size: 24px; font-weight: 800; margin: 0 0 4px 0; }}
-.header-meta {{ font-size: 12px; color: #e2e8f0; }}
-.card {{ background: {p['card']}; border: 1px solid {p['border']}; border-radius: 10px; padding: 18px; margin-bottom: 18px; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th {{ background: {p['forest']}; color: #fff; font-size: 11px; text-transform: uppercase; padding: 8px 10px; text-align: left; }}
-td {{ padding: 8px 10px; border-bottom: 1px solid #f1f5f9; font-size: 13px; }}
-.pill {{ padding: 2px 10px; border-radius: 12px; font-weight: 700; font-size: 11px; }}
-.pill-win {{ background: {p['win_bg']}; color: {p['win_text']}; }}
-.pill-warn {{ background: {p['warn_bg']}; color: {p['warn_text']}; }}
-.pill-bad {{ background: {p['bad_bg']}; color: {p['bad_text']}; }}
-h2 {{ font-size: 16px; margin-top: 0; }}
-@media print {{ body {{ background: #fff; }} }}
-</style></head>
+<html lang="en"><head><meta charset="UTF-8"><title>{_html_escape(name)} — ESG KPI Report</title>
+<style>{_HTML_STYLE.format(**p)}</style></head>
 <body>
 <div class="header-card">
-  <div style="font-size:11px; text-transform:uppercase; color:#a3e635; font-weight:700;">ESG Executive Report</div>
+  <div style="font-size:11px; text-transform:uppercase; color:#a3e635; font-weight:700;">ESG KPI Report</div>
   <div class="header-title">{_html_escape(name)}</div>
-  <div class="header-meta">{len(metrics)} metrics extracted · {covered_count}/9 BRSR Core principles disclosed · Framework: SEBI BRSR / GRI</div>
+  <div class="header-meta">{cov['disclosed']}/{cov['total']} KPIs disclosed · {cov['derived']} derived (unit-converted or computed from stated figures)</div>
 </div>
+{sections}
 <div class="card">
-  <h2>BRSR Core Gaps</h2>
+  <h2>Not disclosed</h2>
   <ul>{gap_rows}</ul>
-</div>
-<div class="card">
-  <h2>Extracted Metrics</h2>
-  <table><thead><tr><th>Metric</th><th>Value</th><th>Year</th><th>GRI Code</th><th>BRSR Principle</th><th>Assurance</th></tr></thead>
-  <tbody>{rows_html}</tbody></table>
 </div>
 <p style="font-size:11px; color:#64748b;">Open this file in a browser and use Print → Save as PDF for a PDF copy.</p>
 </body></html>"""
 
 
+def _comparable(ra: dict, rb: dict):
+    """Both current headline numbers in the same unit -> (a, b), else None."""
+    if not (is_disclosed(ra) and is_disclosed(rb)):
+        return None
+    if "reported_unit_mismatch" in (ra.get("status"), rb.get("status")):
+        return None
+    va, vb = headline_value(ra["current"]), headline_value(rb["current"])
+    if va is None or vb is None:
+        return None
+    if (ra["current"].get("unit") or "") != (rb["current"].get("unit") or ""):
+        return None
+    return va, vb
+
+
 def _build_comparison_html(company_a: str, data_a: dict, company_b: str, data_b: dict) -> str:
-    """Two-company styled HTML comparison report with delta/winner callouts."""
+    """Two-company styled HTML comparison across all KPIs."""
     p = HTML_PALETTE
-    names_a = {m.get("metric_name"): m for m in data_a["metrics"] if m.get("metric_name")}
-    names_b = {m.get("metric_name"): m for m in data_b["metrics"] if m.get("metric_name")}
-    shared = sorted(set(names_a) & set(names_b))
+    by_a = {r["kpi_id"]: r for r in data_a["kpis"]}
+    by_b = {r["kpi_id"]: r for r in data_b["kpis"]}
 
     rows_html = ""
-    for metric_name in shared:
-        ma, mb = names_a[metric_name], names_b[metric_name]
-        va, vb = ma.get("value"), mb.get("value")
+    for kpi in KPI_CATALOG:
+        ra, rb = by_a.get(kpi["id"]), by_b.get(kpi["id"])
+        if not ra or not rb:
+            continue
         winner_html, delta_html = "—", "—"
-        if isinstance(va, (int, float)) and isinstance(vb, (int, float)) and vb != 0:
-            delta_pct = ((va - vb) / abs(vb)) * 100
-            delta_html = f"{delta_pct:+.1f}%"
-            direction = _metric_direction(metric_name)
+        pair = _comparable(ra, rb)
+        if pair:
+            va, vb = pair
+            if vb != 0:
+                delta_html = f"{(va - vb) / abs(vb) * 100:+.1f}%"
+            direction = kpi.get("direction")
+            winner = None
             if direction == "lower":
                 winner = company_a if va < vb else company_b if vb < va else None
             elif direction == "higher":
                 winner = company_a if va > vb else company_b if vb > va else None
-            else:
-                winner = None
-            winner_html = f'<span class="pill pill-win">{_html_escape(winner)}</span>' if winner else "—"
+            if winner:
+                winner_html = f'<span class="pill pill-win">{_html_escape(winner)}</span>'
         rows_html += f"""<tr>
-            <td><strong>{_html_escape(metric_name)}</strong></td>
-            <td>{_html_escape(va)} {_html_escape(ma.get('unit',''))}</td>
-            <td>{_html_escape(vb)} {_html_escape(mb.get('unit',''))}</td>
+            <td><strong>{_html_escape(kpi['id'])}</strong></td>
+            <td>{_html_escape(kpi['name'])}<br><span style="font-size:11px;color:#64748b;">{_html_escape(kpi['required_unit'])}</span></td>
+            <td>{_html_year(ra['current']) if is_disclosed(ra) else '—'}</td>
+            <td>{_html_year(rb['current']) if is_disclosed(rb) else '—'}</td>
             <td>{delta_html}</td>
             <td>{winner_html}</td>
         </tr>"""
 
-    if not shared:
-        rows_html = '<tr><td colspan="5">No identically-named metrics were extracted for both companies to compare directly.</td></tr>'
-
-    cov_a, cov_b = brsr_coverage_report(data_a["metrics"]), brsr_coverage_report(data_b["metrics"])
-    brsr_rows = ""
-    for num, info in cov_a.items():
-        status_a = "Disclosed" if info["covered"] else "Gap"
-        status_b = "Disclosed" if cov_b[num]["covered"] else "Gap"
-        brsr_rows += f"<tr><td>P{num}: {_html_escape(info['principle'])}</td><td>{status_a}</td><td>{status_b}</td></tr>"
+    cov_a, cov_b = kpi_coverage(data_a["kpis"]), kpi_coverage(data_b["kpis"])
+    cov_rows = "".join(
+        f"<tr><td>{cat}</td><td>{cov_a['by_category'][cat]}/{cov_a['category_totals'][cat]}</td>"
+        f"<td>{cov_b['by_category'][cat]}/{cov_b['category_totals'][cat]}</td></tr>"
+        for cat in CATEGORIES
+    )
+    cov_rows += f"<tr><td><strong>Total</strong></td><td><strong>{cov_a['disclosed']}/{cov_a['total']}</strong></td><td><strong>{cov_b['disclosed']}/{cov_b['total']}</strong></td></tr>"
 
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>{_html_escape(company_a)} vs {_html_escape(company_b)} — ESG Comparison</title>
-<style>
-* {{ box-sizing: border-box; }}
-body {{ font-family: 'Plus Jakarta Sans', -apple-system, sans-serif; color: {p['forest']}; background: {p['cream']}; font-size: 14px; line-height: 1.5; margin: 0; padding: 24px; }}
-.header-card {{ background: linear-gradient(135deg, {p['forest']} 0%, #1e4d3e 60%, {p['sage']} 100%); color: #fff; padding: 24px; border-radius: 10px; margin-bottom: 20px; }}
-.header-title {{ font-size: 22px; font-weight: 800; margin: 0 0 4px 0; }}
-.header-meta {{ font-size: 12px; color: #e2e8f0; }}
-.card {{ background: {p['card']}; border: 1px solid {p['border']}; border-radius: 10px; padding: 18px; margin-bottom: 18px; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th {{ background: {p['forest']}; color: #fff; font-size: 11px; text-transform: uppercase; padding: 8px 10px; text-align: left; }}
-td {{ padding: 8px 10px; border-bottom: 1px solid #f1f5f9; font-size: 13px; }}
-.pill {{ padding: 2px 10px; border-radius: 12px; font-weight: 700; font-size: 11px; }}
-.pill-win {{ background: {p['win_bg']}; color: {p['win_text']}; }}
-h2 {{ font-size: 16px; margin-top: 0; }}
-@media print {{ body {{ background: #fff; }} }}
-</style></head>
+<html lang="en"><head><meta charset="UTF-8"><title>{_html_escape(company_a)} vs {_html_escape(company_b)} — ESG KPI Comparison</title>
+<style>{_HTML_STYLE.format(**p)}</style></head>
 <body>
 <div class="header-card">
   <div style="font-size:11px; text-transform:uppercase; color:#a3e635; font-weight:700;">Executive Benchmarking Brief</div>
   <div class="header-title">{_html_escape(company_a)} vs. {_html_escape(company_b)}</div>
-  <div class="header-meta">Framework: SEBI BRSR Core / GRI · Winner direction inferred from common ESG conventions (e.g. lower emissions, higher renewable share) — verify manually for unusual metrics.</div>
+  <div class="header-meta">{len(KPI_CATALOG)} KPIs, current year. Delta and leader only where both values are in the same unit; leader uses each KPI's better direction (e.g. lower emission intensity, higher renewable share).</div>
 </div>
 <div class="card">
-  <h2>Head-to-Head Metrics</h2>
-  <table><thead><tr><th>Metric</th><th>{_html_escape(company_a)}</th><th>{_html_escape(company_b)}</th><th>Delta</th><th>Leader</th></tr></thead>
+  <h2>Head-to-Head KPIs</h2>
+  <table><thead><tr><th>ID</th><th>KPI</th><th>{_html_escape(company_a)}</th><th>{_html_escape(company_b)}</th><th>Delta</th><th>Leader</th></tr></thead>
   <tbody>{rows_html}</tbody></table>
 </div>
 <div class="card">
-  <h2>BRSR Core Principle Coverage</h2>
-  <table><thead><tr><th>Principle</th><th>{_html_escape(company_a)}</th><th>{_html_escape(company_b)}</th></tr></thead>
-  <tbody>{brsr_rows}</tbody></table>
+  <h2>Disclosure coverage</h2>
+  <table><thead><tr><th>Category</th><th>{_html_escape(company_a)}</th><th>{_html_escape(company_b)}</th></tr></thead>
+  <tbody>{cov_rows}</tbody></table>
 </div>
 <p style="font-size:11px; color:#64748b;">Open this file in a browser and use Print → Save as PDF for a PDF copy.</p>
 </body></html>"""
@@ -1462,9 +1350,9 @@ def render_report_tab(name: str, data: dict):
 
     presets = {
         "Full report": list(REPORT_PAGES.keys()),
-        "Environmental only": ["Cover / Snapshot", "Environmental"],
+        "Environment only": ["Cover / Snapshot", "Environment"],
         "Social only": ["Cover / Snapshot", "Social"],
-        "Governance & compliance only": ["Cover / Snapshot", "Governance & Gaps"],
+        "Governance & financial": ["Cover / Snapshot", "Governance", "Financial"],
     }
     preset_cols = st.columns(len(presets))
     for col, (label, pages) in zip(preset_cols, presets.items()):
@@ -1474,6 +1362,10 @@ def render_report_tab(name: str, data: dict):
                 st.rerun()
 
     page_names = list(REPORT_PAGES.keys())
+    # A selection saved under the old page names would make the multiselect raise.
+    saved = st.session_state.get(f"report_sections_{name}")
+    if saved is not None and any(page not in page_names for page in saved):
+        st.session_state[f"report_sections_{name}"] = [page for page in saved if page in page_names] or page_names
     selected_pages = st.multiselect(
         "Sections to include",
         page_names,
@@ -1509,7 +1401,7 @@ def render_report_tab(name: str, data: dict):
             st.download_button(
                 "Download report as PDF",
                 st.session_state[f"report_pdf_bytes_{name}"],
-                file_name=f"{name}_ESG_Report.pdf",
+                file_name=f"{name}_ESG_KPI_Report.pdf",
                 mime="application/pdf",
                 key=f"dl_pdf_{name}",
             )
@@ -1518,7 +1410,7 @@ def render_report_tab(name: str, data: dict):
     st.download_button(
         "🎨 Download styled HTML report (Forest Pine design)",
         _build_executive_html(name, data),
-        file_name=f"{name}_ESG_Executive_Report.html",
+        file_name=f"{name}_ESG_KPI_Report.html",
         mime="text/html",
         key=f"dl_html_{name}",
         help="No extra installs needed. Open the downloaded file in any browser, then use Print → Save as PDF for a PDF copy.",
@@ -1526,7 +1418,7 @@ def render_report_tab(name: str, data: dict):
 
 
 def render_compare_tab():
-    reports = [report for report in st.session_state["reports"] if report.get("metrics")]
+    reports = [report for report in st.session_state["reports"] if report_ready(report)]
     if len(reports) < 2:
         st.info("Extract at least two reports to compare them. A single report can still be downloaded as CSV from All companies.")
         return
@@ -1535,58 +1427,55 @@ def render_compare_tab():
     st.caption("Comparing " + ", ".join(names) + ".")
 
     summary_rows = []
+    chart_rows = []
     for report in reports:
-        counts = _coverage_counts(report["metrics"])
+        counts = _coverage_counts(report["kpis"])
         summary_rows.append({
             "Company": report["name"],
-            "Metrics extracted": counts["metrics"],
-            "BRSR principles covered": counts["brsr"],
-            "Environmental": counts["Environmental"],
-            "Social": counts["Social"],
-            "Governance": counts["Governance"],
+            "KPIs disclosed": counts["disclosed"],
+            "Derived": str(counts["derived"]),
+            **{cat: counts[cat] for cat in CATEGORIES},
         })
-    summary_df = pd.DataFrame(summary_rows)
-    st.dataframe(summary_df, width="stretch", hide_index=True)
-    st.bar_chart(summary_df.set_index("Company")[["Environmental", "Social", "Governance"]])
+        chart_rows.append({"Company": report["name"], **{cat: counts[f"{cat}_n"] for cat in CATEGORIES}})
+    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+    st.bar_chart(pd.DataFrame(chart_rows).set_index("Company")[list(CATEGORIES)])
 
-    st.subheader("Metrics found in more than one report")
-    shared_rows = _shared_metric_rows(reports)
-    if shared_rows:
-        shared_df = pd.DataFrame(shared_rows)
-        st.dataframe(shared_df, width="stretch", hide_index=True)
-        st.download_button(
-            "Download comparison CSV",
-            shared_df.to_csv(index=False),
-            file_name="esg_comparison.csv",
-            mime="text/csv",
-            key="dl_shared_csv",
-        )
-    else:
-        st.caption("No metric names matched across companies. Use the lookup below to see who reported a given metric.")
+    st.subheader(f"All {len(KPI_CATALOG)} KPIs side by side")
+    year_label = st.radio("Year", ["Current year", "Previous year"], horizontal=True, key="compare_year")
+    year = "current" if year_label == "Current year" else "previous"
+    matrix_df = pd.DataFrame(_kpi_matrix_rows(reports, year))
+    st.dataframe(matrix_df, width="stretch", hide_index=True)
+    st.caption("`*` = derived (unit-converted or computed from stated figures). `—` = not disclosed.")
+    st.download_button(
+        "Download comparison CSV",
+        matrix_df.to_csv(index=False),
+        file_name=f"esg_kpi_comparison_{year}.csv",
+        mime="text/csv",
+        key="dl_shared_csv",
+    )
 
-    st.subheader("Look up one metric")
-    all_metric_names = sorted({
-        metric.get("metric_name")
-        for report in reports
-        for metric in report["metrics"]
-        if metric.get("metric_name")
-    })
-    if all_metric_names:
-        chosen_metric = st.selectbox("Metric", all_metric_names, key="compare_metric_select")
-        rows = []
-        for report in reports:
-            match = next((item for item in report["metrics"] if item.get("metric_name") == chosen_metric), None)
-            if match:
-                year = match.get("year")
-                rows.append({
-                    "Company": report["name"],
-                    "Value": str(match.get("value")),
-                    "Unit": match.get("unit"),
-                    "Year": "" if year is None else str(year),
-                })
-            else:
-                rows.append({"Company": report["name"], "Value": "Not extracted", "Unit": "—", "Year": "—"})
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.subheader("Look up one KPI")
+    options = [f"{k['id']} — {k['name']}" for k in KPI_CATALOG]
+    chosen = st.selectbox("KPI", options, key="compare_metric_select")
+    chosen_id = chosen.split(" — ", 1)[0]
+    rows = []
+    for report in reports:
+        match = next((r for r in report["kpis"] if r["kpi_id"] == chosen_id), None)
+        if match and is_disclosed(match):
+            rows.append({
+                "Company": report["name"],
+                "Current FY": match["current"].get("fy") or "",
+                "Current": format_year(match["current"]),
+                "Previous FY": match["previous"].get("fy") or "",
+                "Previous": format_year(match["previous"]),
+                "Unit": _kpi_unit(match),
+                "Status": STATUS_LABELS.get(match["status"], match["status"]),
+                "Derivation": match.get("derivation") or "",
+            })
+        else:
+            rows.append({"Company": report["name"], "Current FY": "", "Current": "Not disclosed", "Previous FY": "",
+                         "Previous": "", "Unit": "", "Status": "Not disclosed", "Derivation": ""})
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     st.subheader("Styled two-company report")
     if len(names) == 2:
@@ -1605,7 +1494,7 @@ def render_compare_tab():
         st.download_button(
             "Download styled HTML comparison",
             _build_comparison_html(left_name, data_left, right_name, data_right),
-            file_name=f"{_safe_download_stem(left_name)}_vs_{_safe_download_stem(right_name)}_Comparison.html",
+            file_name=f"{_safe_download_stem(left_name)}_vs_{_safe_download_stem(right_name)}_KPI_Comparison.html",
             mime="text/html",
             key="dl_compare_html",
             help="Open the file in a browser, then use Print → Save as PDF.",
@@ -1613,8 +1502,8 @@ def render_compare_tab():
 
     st.subheader("Ask a comparison question")
     st.caption("Grounded in every extracted report.")
-    combined_metrics, topic_index, page_map, full_text = _merged_chat_context(reports)
-    compare_question = st.chat_input("e.g. Which company has better emissions performance?", key="compare_chat_input")
+    combined_kpis, topic_index, page_map, full_text = _merged_chat_context(reports)
+    compare_question = st.chat_input("e.g. Which company has the lower emission intensity?", key="compare_chat_input")
     if compare_question:
         with st.chat_message("user"):
             st.write(compare_question)
@@ -1626,7 +1515,7 @@ def render_compare_tab():
         result = answer_chat_question(
             question=compare_question,
             company_name=" vs ".join(names),
-            metrics=combined_metrics,
+            kpis=combined_kpis,
             topic_index=topic_index,
             page_map=page_map,
             full_text=full_text,
@@ -1638,10 +1527,11 @@ def render_compare_tab():
             st.write(result["answer"])
 
 
+
 def render_company_tab():
-    ready = [report for report in st.session_state["reports"] if report.get("metrics")]
+    ready = [report for report in st.session_state["reports"] if report_ready(report)]
     if not ready:
-        st.info("No report produced metrics to open.")
+        st.info("No report produced KPIs to open.")
         return
 
     selected = st.selectbox("Company", [report["name"] for report in ready], key="open_company")
@@ -1678,8 +1568,8 @@ elif (scan_running or st.session_state.get("_inline_auto_continue")) and not rep
     st.header("Scan in progress")
     render_upload_section()
 else:
-    ready_count = sum(1 for report in reports if report.get("metrics"))
-    st.caption(f"{ready_count} of {len(reports)} reports have extracted metrics.")
+    ready_count = sum(1 for report in reports if report_ready(report))
+    st.caption(f"{ready_count} of {len(reports)} reports have extracted KPIs.")
     with st.expander("Add or extract more reports", expanded=False):
         render_upload_section()
         st.caption("Already-extracted reports are preserved automatically. Use Clear reports to remove everything.")

@@ -4,6 +4,7 @@ import subprocess
 import sys
 import traceback
 
+from kpis import report_ready
 from pipeline import extract_one_pdf
 from store import (
     clear_pending_job,
@@ -17,7 +18,7 @@ from store import (
 
 def _already_extracted(reports, company_name, source_file):
     for report in reports:
-        if not report.get("metrics"):
+        if not report_ready(report):
             continue
         if source_file and report.get("source_file") == source_file:
             return True
@@ -57,7 +58,7 @@ def run_single_item(index):
         report = {
             "name": company_name,
             "source_file": source_file,
-            "metrics": [],
+            "kpis": [],
             "topic_index": [],
             "page_map": {},
             "full_text": "",
@@ -69,7 +70,7 @@ def run_single_item(index):
 
     reports = upsert_report(report)
     mark_pending_item_done(index)
-    ready_count = sum(1 for entry in reports if entry.get("metrics"))
+    ready_count = sum(1 for entry in reports if report_ready(entry))
     save_job(
         status="running",
         progress=(index + 1) / max(total, 1),
@@ -111,7 +112,7 @@ def run_job():
                 report = {
                     "name": company_name,
                     "source_file": source_file,
-                    "metrics": [],
+                    "kpis": [],
                     "topic_index": [],
                     "page_map": {},
                     "full_text": "",
@@ -130,7 +131,7 @@ def run_job():
             )
             if result.returncode != 0:
                 reports = load_reports()
-                ready_count = sum(1 for entry in reports if entry.get("metrics"))
+                ready_count = sum(1 for entry in reports if report_ready(entry))
                 save_job(
                     status="failed",
                     message=(
@@ -145,12 +146,12 @@ def run_job():
                 return result.returncode
 
         reports = load_reports()
-        ready_count = sum(1 for report in reports if report.get("metrics"))
+        ready_count = sum(1 for report in reports if report_ready(report))
         clear_pending_job()
         save_job(
             status="completed",
             progress=1.0,
-            message=f"Finished. {ready_count} of {len(reports)} saved reports produced metrics.",
+            message=f"Finished. {ready_count} of {len(reports)} saved reports produced KPIs.",
             ready_count=ready_count,
             total_count=total,
             current_index=total,
@@ -158,7 +159,7 @@ def run_job():
         return 0
     except Exception:
         reports = load_reports()
-        ready_count = sum(1 for report in reports if report.get("metrics"))
+        ready_count = sum(1 for report in reports if report_ready(report))
         save_job(
             status="failed",
             message=f"Extraction interrupted. {ready_count} completed report(s) are saved and ready to view.",
