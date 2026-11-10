@@ -183,7 +183,45 @@ def test_standardize_fy():
     assert standardize_fy("FY 2025-26") == "FY2026"
     assert standardize_fy("FY26") == "FY2026"
     assert standardize_fy("2026") == "FY2026"
+    assert standardize_fy("Jan 24 - Dec 24") == "FY2024"
+    assert standardize_fy("Jan 25 - Dec 25") == "FY2025"
+    assert standardize_fy("CY 2024") == "FY2024"
+    assert standardize_fy("invalid-text") == ""
     assert standardize_fy(None) == ""
+
+
+def test_component_and_text_kpi_year_slots():
+    from kpis import company_multi_year_frame
+    _, records = run([
+        {"kpi_id": "E1", "current": {"fy": "FY 2025-26", "value": 97.5}, "previous": {"fy": "FY 2024-25", "value": 96.98}},
+        {"kpi_id": "S2", "current": {"components": {"employees": 0, "workers": 0}},
+                        "previous": {"components": {"employees": 0, "workers": 0}}},
+        {"kpi_id": "S10", "current": {"components": {"filed": 11, "resolved": 11, "pending": 0}},
+                         "previous": {"components": {"filed": 7, "resolved": 7, "pending": 0}}},
+        {"kpi_id": "E4", "current": {"fy": "Jan 25 - Dec 25", "value": 10535856},
+                        "previous": {"fy": "Jan 24 - Dec 24", "value": 9962535}},
+    ])
+    report = {"name": "BRSR26 HUL", "kpis": records}
+    df = company_multi_year_frame(report)
+    
+    # S2 must be populated for FY2026 and FY2025
+    s2_row = df[df["S. No."] == "S2"].iloc[0]
+    assert "employees 0" in s2_row["FY2026"]
+    assert "employees 0" in s2_row["FY2025"]
+    assert s2_row["FY2024"] == ""  # Not disclosed in FY2024 report
+
+    # S10 must be populated
+    s10_row = df[df["S. No."] == "S10"].iloc[0]
+    assert "filed 11" in s10_row["FY2026"]
+    assert "filed 7" in s10_row["FY2025"]
+
+    # E4 Scope 3 must be populated under FY2026 and FY2025
+    e4_row = df[df["S. No."] == "E4"].iloc[0]
+    assert "10,535,856" in e4_row["FY2026"] or "10535856" in e4_row["FY2026"]
+    assert "9,962,535" in e4_row["FY2025"] or "9962535" in e4_row["FY2025"]
+
+    # Ghost columns must NOT exist
+    assert "FYJAN" not in "".join(df.columns)
 
 
 def test_company_multi_year_frame_and_comparative():

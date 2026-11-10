@@ -797,13 +797,15 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
         rec["derivation"] = "; ".join(notes) if notes else None
         years_map = {}
         for y in YEARS:
-            fy_label = standardize_fy(slots[y].get("fy"))
-            if fy_label:
-                years_map[fy_label] = dict(slots[y])
-        if raw.get("years") and isinstance(raw["years"], dict):
-            for k, v in raw["years"].items():
+            y_slot = rec.get(y) or {}
+            fy_label = standardize_fy(y_slot.get("fy"))
+            if fy_label and _slot_has_data(y_slot):
+                years_map[fy_label] = dict(y_slot)
+        raw_rec = merged.get(kid) or {}
+        if raw_rec.get("years") and isinstance(raw_rec["years"], dict):
+            for k, v in raw_rec["years"].items():
                 std_k = standardize_fy(k)
-                if std_k and std_k not in years_map:
+                if std_k and std_k not in years_map and _slot_has_data(v):
                     years_map[std_k] = v
         rec["years"] = years_map
         out.append(rec)
@@ -901,30 +903,66 @@ def is_legacy_report(report: dict) -> bool:
 # ---------------------------------------------------------------------
 # Multi-year formatting & Excel/CSV export helpers
 # ---------------------------------------------------------------------
+def _slot_has_data(slot: dict | None) -> bool:
+    """Returns True if the slot contains an actual value, component, or qualitative text."""
+    if not slot or not isinstance(slot, dict):
+        return False
+    if slot.get("value") is not None:
+        return True
+    comps = slot.get("components") or {}
+    if any(v is not None and v != "" for v in comps.values()):
+        return True
+    if slot.get("text"):
+        return True
+    return False
+
+
 def standardize_fy(raw: str | None) -> str:
-    """Standardizes financial year strings like 'FY 2024-25', '2024-25', 'FY25' into 'FY2025'."""
+    """
+    Standardizes financial and calendar year strings into clean 'FY20XX' format.
+    Handles 'FY 2024-25', '2024-25', 'FY25', 'Jan 24 - Dec 24', 'CY 2024', '2024'.
+    Returns '' for non-year strings so ghost columns are never created.
+    """
     if not raw:
         return ""
     s = str(raw).strip()
-    m = re.search(r"(?:FY\s*)?(\d{2,4})\s*[-/]\s*(\d{2,4})", s, re.IGNORECASE)
+
+    # 1. Calendar year range like 'Jan 24 - Dec 24', 'Jan 2024 - Dec 2024', 'Jan 24 – Dec 24'
+    m = re.search(r"(?:jan|dec)[a-z]*\s*(\d{2,4})\s*[-/–—]\s*(?:jan|dec)[a-z]*\s*(\d{2,4})", s, re.IGNORECASE)
     if m:
-        end_yr = m.group(2)
-        if len(end_yr) == 2:
-            return f"FY20{end_yr}"
-        elif len(end_yr) == 4:
-            return f"FY{end_yr}"
+        yr = m.group(2)
+        return f"FY20{yr}" if len(yr) == 2 else f"FY{yr}"
+
+    # 2. Indian FY range: 'FY 2024-25', '2024-25', 'FY 24-25', '2024-2025'
+    m = re.search(r"(?:FY\s*)?(\d{2,4})\s*[-/–—]\s*(\d{2,4})", s, re.IGNORECASE)
+    if m:
+        if not re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", s, re.IGNORECASE):
+            end_yr = m.group(2)
+            return f"FY20{end_yr}" if len(end_yr) == 2 else f"FY{end_yr}"
+
+    # 3. Calendar Year like 'CY 2024' or 'CY24'
+    m = re.search(r"CY\s*(\d{2,4})", s, re.IGNORECASE)
+    if m:
+        yr = m.group(1)
+        return f"FY20{yr}" if len(yr) == 2 else f"FY{yr}"
+
+    # 4. Standard FY like 'FY 2025' or 'FY25'
     m = re.search(r"FY\s*(\d{2,4})", s, re.IGNORECASE)
     if m:
         yr = m.group(1)
-        if len(yr) == 2:
-            return f"FY20{yr}"
-        elif len(yr) == 4:
-            return f"FY{yr}"
+        return f"FY20{yr}" if len(yr) == 2 else f"FY{yr}"
+
+    # 5. Standalone 4-digit year like '2025'
     m = re.search(r"\b(20\d\d)\b", s)
     if m:
         return f"FY{m.group(1)}"
+
+    # 6. Fallback: if already starts with FY and followed by 4 digits
     clean = re.sub(r"\s+", "", s).upper()
-    return clean if clean.startswith("FY") else f"FY{clean}"
+    if re.match(r"^FY20\d\d$", clean):
+        return clean
+
+    return ""
 
 
 def extract_report_dominant_years(report: dict) -> tuple[str, str]:
@@ -934,9 +972,9 @@ def extract_report_dominant_years(report: dict) -> tuple[str, str]:
     for r in (report or {}).get("kpis") or []:
         c_fy = standardize_fy((r.get("current") or {}).get("fy"))
         p_fy = standardize_fy((r.get("previous") or {}).get("fy"))
-        if c_fy:
+        if c_fy and re.match(r"^FY20\d\d$", c_fy):
             cur_counts[c_fy] = cur_counts.get(c_fy, 0) + 1
-        if p_fy:
+        if p_fy and re.match(r"^FY20\d\d$", p_fy):
             prev_counts[p_fy] = prev_counts.get(p_fy, 0) + 1
     dom_cur = max(cur_counts, key=cur_counts.get) if cur_counts else "FY2025"
     dom_prev = max(prev_counts, key=prev_counts.get) if prev_counts else "FY2024"
@@ -951,42 +989,41 @@ def get_kpi_slot_for_fy(record: dict, target_fy: str, report: dict | None = None
     if not target_std:
         return None
 
-    # Check explicit 'years' dictionary if present
-    years_dict = record.get("years") or {}
-    for y_key, slot in years_dict.items():
-        if standardize_fy(y_key) == target_std and slot:
-            return slot
-
-    # Check current year slot
     cur_slot = record.get("current") or {}
-    cur_fy = standardize_fy(cur_slot.get("fy"))
-    if cur_fy == target_std:
-        return cur_slot
-
-    # Check previous year slot
     prev_slot = record.get("previous") or {}
+    cur_fy = standardize_fy(cur_slot.get("fy"))
     prev_fy = standardize_fy(prev_slot.get("fy"))
-    if prev_fy == target_std:
-        return prev_slot
 
-    # Fallback to dominant report years if slot has no explicit FY string
+    # 1. Match against report dominant current and previous financial years
     if report:
         dom_cur, dom_prev = extract_report_dominant_years(report)
-        if target_std == dom_cur and not cur_fy and cur_slot.get("value") is not None:
+        if target_std == dom_cur and _slot_has_data(cur_slot):
             return cur_slot
-        if target_std == dom_prev and not prev_fy and prev_slot.get("value") is not None:
+        if target_std == dom_prev and _slot_has_data(prev_slot):
             return prev_slot
+
+    # 2. Check explicit matching FY on the slots
+    if cur_fy == target_std and _slot_has_data(cur_slot):
+        return cur_slot
+    if prev_fy == target_std and _slot_has_data(prev_slot):
+        return prev_slot
+
+    # 3. Check explicit 'years' dictionary if present (from merged multi-report uploads)
+    years_dict = record.get("years") or {}
+    for y_key, slot in years_dict.items():
+        if standardize_fy(y_key) == target_std and _slot_has_data(slot):
+            return slot
 
     return None
 
 
 def get_kpi_value_for_fy(record: dict, target_fy: str, report: dict | None = None) -> str:
-    """Returns human-readable formatted string for a specific financial year, or '—' if unavailable."""
+    """Returns human-readable formatted string for a specific financial year, or empty string '' if unavailable."""
     slot = get_kpi_slot_for_fy(record, target_fy, report)
     if not slot:
-        return "—"
+        return ""
     val = format_year(slot)
-    return val if val else "—"
+    return val if val else ""
 
 
 def company_multi_year_frame(report: dict, years: list[str] | None = None):
@@ -996,28 +1033,32 @@ def company_multi_year_frame(report: dict, years: list[str] | None = None):
     """
     import pandas as pd
     kpis = (report or {}).get("kpis") or []
-    
-    # Collect all available years
+
+    # Collect valid financial years
     found_years = set()
-    for r in kpis:
-        for slot in (r.get("current"), r.get("previous")):
-            if slot and slot.get("fy"):
-                std = standardize_fy(slot.get("fy"))
-                if std:
-                    found_years.add(std)
-        for y_key in (r.get("years") or {}).keys():
-            std = standardize_fy(y_key)
-            if std:
-                found_years.add(std)
-                
     dom_cur, dom_prev = extract_report_dominant_years(report)
-    if dom_cur:
+    if dom_cur and re.match(r"^FY20\d\d$", dom_cur):
         found_years.add(dom_cur)
-    if dom_prev:
+    if dom_prev and re.match(r"^FY20\d\d$", dom_prev):
         found_years.add(dom_prev)
 
-    base_years = list(years) if years else ["FY2024", "FY2025", "FY2026"]
-    all_years = sorted(set(base_years).union(found_years))
+    for r in kpis:
+        for slot in (r.get("current"), r.get("previous")):
+            if slot and _slot_has_data(slot):
+                std = standardize_fy(slot.get("fy"))
+                if std and re.match(r"^FY20\d\d$", std):
+                    found_years.add(std)
+        for y_key, slot in (r.get("years") or {}).items():
+            if _slot_has_data(slot):
+                std = standardize_fy(y_key)
+                if std and re.match(r"^FY20\d\d$", std):
+                    found_years.add(std)
+
+    if years:
+        all_years = sorted(set(years))
+    else:
+        base = {"FY2024", "FY2025", "FY2026"}
+        all_years = sorted(base.union(found_years))
 
     rows = []
     for r in kpis:
@@ -1048,6 +1089,23 @@ def comparative_analysis_frame(reports: list[dict], target_fy: str = "FY2026"):
         c_name = rep.get("name", "Unknown")
         by_id = {r["kpi_id"]: r for r in rep.get("kpis", [])}
         by_company.append((c_name, rep, by_id))
+
+    rows = []
+    for kpi in KPI_CATALOG:
+        kid = kpi["id"]
+        row = {
+            "S. No.": kid,
+            "KPI Name": kpi["name"],
+            "Unit": kpi["required_unit"],
+        }
+        for c_name, rep, by_id in by_company:
+            rec = by_id.get(kid)
+            if not rec:
+                row[c_name] = ""
+            else:
+                row[c_name] = get_kpi_value_for_fy(rec, target_fy, rep)
+        rows.append(row)
+    return pd.DataFrame(rows)
 
     rows = []
     for kpi in KPI_CATALOG:

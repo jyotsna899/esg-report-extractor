@@ -281,17 +281,24 @@ def kpi_frame(kpis: list[dict], company: str | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _combined_kpi_csv(reports: list[dict]) -> str:
+def _df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Encodes a DataFrame into UTF-8 with BOM (utf-8-sig) so Excel never shows mojibake (â€)."""
+    if df is None or df.empty:
+        return b""
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def _combined_kpi_csv(reports: list[dict]) -> bytes:
     frames = [kpi_frame(report["kpis"], company=report["name"]) for report in reports if report_ready(report)]
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
-        return ""
-    return pd.concat(frames, ignore_index=True).to_csv(index=False)
+        return b""
+    return _df_to_csv_bytes(pd.concat(frames, ignore_index=True))
 
 
-def _combined_multi_year_csv(reports: list[dict]) -> str:
+def _combined_multi_year_csv(reports: list[dict]) -> bytes:
     df = consolidated_multi_year_frame(reports)
-    return "" if df.empty else df.to_csv(index=False)
+    return _df_to_csv_bytes(df)
 
 
 def _reports_csv_zip(reports: list[dict], target_fy: str = "FY2026") -> bytes:
@@ -308,15 +315,15 @@ def _reports_csv_zip(reports: list[dict], target_fy: str = "FY2026") -> bytes:
                 filename = f"{stem}_multi_year_{n}.csv"
                 n += 1
             used.add(filename)
-            archive.writestr(filename, company_multi_year_frame(report).to_csv(index=False))
+            archive.writestr(filename, _df_to_csv_bytes(company_multi_year_frame(report)))
         # Add Comparative Analysis CSV
         comp_df = comparative_analysis_frame(reports, target_fy=target_fy)
         if not comp_df.empty:
-            archive.writestr(f"comparative_analysis_{target_fy}.csv", comp_df.to_csv(index=False))
+            archive.writestr(f"comparative_analysis_{target_fy}.csv", _df_to_csv_bytes(comp_df))
         # Add Consolidated Multi-Year CSV
         all_df = consolidated_multi_year_frame(reports)
         if not all_df.empty:
-            archive.writestr("all_companies_multi_year.csv", all_df.to_csv(index=False))
+            archive.writestr("all_companies_multi_year.csv", _df_to_csv_bytes(all_df))
         # Add Excel Workbook
         try:
             excel_bytes = export_excel_workbook(reports, target_fy=target_fy)
@@ -729,7 +736,7 @@ def render_results_overview(reports: list[dict]):
                 c_multi_df = company_multi_year_frame(report)
                 st.download_button(
                     f"CSV — {report['name']} (Multi-Year)",
-                    c_multi_df.to_csv(index=False),
+                    _df_to_csv_bytes(c_multi_df),
                     file_name=f"{_safe_download_stem(report['name'])}_multi_year.csv",
                     mime="text/csv",
                     key=f"dl_one_{index}_{_safe_download_stem(report['name'])}",
@@ -767,7 +774,7 @@ def render_detail_tab(name: str, data: dict):
     with col1:
         st.download_button(
             "📥 Download Multi-Year CSV",
-            multi_df.to_csv(index=False),
+            _df_to_csv_bytes(multi_df),
             file_name=f"{_safe_download_stem(name)}_multi_year.csv",
             mime="text/csv",
             key=f"dl_multi_csv_{name}"
@@ -775,7 +782,7 @@ def render_detail_tab(name: str, data: dict):
     with col2:
         st.download_button(
             "📥 Download Standard CSV",
-            df.to_csv(index=False),
+            _df_to_csv_bytes(df),
             file_name=f"{_safe_download_stem(name)}_kpis.csv",
             mime="text/csv",
             key=f"dl_csv_{name}"
@@ -1549,7 +1556,7 @@ def render_compare_tab():
     with col_dl1:
         st.download_button(
             f"📥 Download CSV ({selected_fy})",
-            comp_df.to_csv(index=False),
+            _df_to_csv_bytes(comp_df),
             file_name=f"comparative_analysis_{selected_fy}.csv",
             mime="text/csv",
             key="dl_comp_csv_btn",
