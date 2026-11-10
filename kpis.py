@@ -351,7 +351,7 @@ def _is_pct_unit(unit) -> bool:
 
 
 def _empty_year():
-    return {"fy": None, "value": None, "unit": None, "components": {}, "text": None, "inputs": {}}
+    return {"fy": None, "value": None, "unit": None, "components": {}, "text": None, "inputs": {}, "pages": []}
 
 
 def _clean_year(raw) -> dict:
@@ -385,6 +385,11 @@ def _clean_year(raw) -> dict:
                 if n is not None:
                     clean[k] = {"value": n, "unit": None}
         out["inputs"] = clean
+    pages = raw.get("pages")
+    if isinstance(pages, list):
+        out["pages"] = [int(p) for p in pages if to_number(p) is not None]
+    elif to_number(pages) is not None:
+        out["pages"] = [int(to_number(pages))]
     return out
 
 
@@ -433,9 +438,19 @@ def merge_chunk_kpis(per_chunk: list[list[dict]]) -> dict:
                 pages = [pages]
             page_nums = [int(p) for p in pages if to_number(p) is not None]
             for y in YEARS:
-                slot = _clean_year(item.get(y))
+                raw_slot = item.get(y)
+                slot = _clean_year(raw_slot)
+                slot_pages = list(slot.get("pages") or [])
+                if not slot_pages and page_nums:
+                    if len(page_nums) == 1:
+                        slot_pages = list(page_nums)
+                    elif len(page_nums) == 2:
+                        slot_pages = [page_nums[0]] if y == "previous" else [page_nums[1]]
+                    else:
+                        slot_pages = list(page_nums)
+                slot["pages"] = slot_pages
                 if _slot_score(KPI_BY_ID[kid], slot) > 0:
-                    candidates[kid][y].append((slot, item.get("source_context"), page_nums))
+                    candidates[kid][y].append((slot, item.get("source_context"), slot_pages))
 
     merged = {}
     for kid in KPI_IDS:
@@ -448,14 +463,18 @@ def merge_chunk_kpis(per_chunk: list[list[dict]]) -> dict:
                 continue
             best_idx = max(range(len(cands)), key=lambda i: (_slot_score(kpi, cands[i][0]), -i))
             best, ctx, pages = cands[best_idx]
-            best = {**best, "components": dict(best["components"]), "inputs": dict(best["inputs"])}
-            for other, _, _ in cands:
+            best = {**best, "components": dict(best["components"]), "inputs": dict(best["inputs"]), "pages": list(pages or best.get("pages") or [])}
+            for other, _, other_pages in cands:
                 for k, v in other["components"].items():
                     best["components"].setdefault(k, v)
                 for k, v in other["inputs"].items():
                     best["inputs"].setdefault(k, v)
                 if not best["fy"] and other["fy"]:
                     best["fy"] = other["fy"]
+                for p in (other_pages or other.get("pages") or []):
+                    if p not in best["pages"]:
+                        best["pages"].append(p)
+            best["pages"].sort()
             entry[y] = best
             if ctx and not entry["source_context"]:
                 entry["source_context"] = ctx
@@ -740,6 +759,7 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
             slot = dict(raw.get(y) or _empty_year())
             slot["components"] = dict(slot.get("components") or {})
             slot["inputs"] = dict(slot.get("inputs") or {})
+            slot["pages"] = list(slot.get("pages") or raw.get("pages") or [])
             for key in ("fy", "value", "unit", "text"):
                 slot.setdefault(key, None)
             year_notes = []
@@ -773,6 +793,7 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
             if pct is not None:
                 s13[y]["value"], s13[y]["unit"] = round(pct, 2), "%"
                 s13[y]["fy"] = s13[y]["fy"] or s12[y]["fy"]
+                s13[y]["pages"] = list(s12[y].get("pages") or s12["pages"])
                 s13["_year_status"][y] = "derived"
                 s13["_notes"].append(f"{y}: spent {_fmt(sp)} / budgeted {_fmt(b)} × 100 = {pct:.2f}% (from S12)")
                 if not s13["pages"]:
@@ -796,17 +817,14 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
         rec["year_status"] = ys
         rec["derivation"] = "; ".join(notes) if notes else None
         years_map = {}
-        for y in YEARS:
-            y_slot = rec.get(y) or {}
-            fy_label = standardize_fy(y_slot.get("fy"))
-            if fy_label and _slot_has_data(y_slot):
-                years_map[fy_label] = dict(y_slot)
         raw_rec = merged.get(kid) or {}
         if raw_rec.get("years") and isinstance(raw_rec["years"], dict):
             for k, v in raw_rec["years"].items():
                 std_k = standardize_fy(k)
-                if std_k and std_k not in years_map and _slot_has_data(v):
-                    years_map[std_k] = v
+                if std_k and _slot_has_data(v):
+                    v_dict = dict(v)
+                    v_dict.setdefault("pages", list(raw_rec.get("pages") or []))
+                    years_map[std_k] = v_dict
         rec["years"] = years_map
         out.append(rec)
     return out
@@ -1001,8 +1019,15 @@ def get_kpi_slot_for_fy(record: dict, target_fy: str, report: dict | None = None
             return cur_slot
         if target_std == dom_prev and _slot_has_data(prev_slot):
             return prev_slot
+        # In a single report, cur_slot is dom_cur and prev_slot is dom_prev.
+        # Additional historical years come from record["years"] if merged from multiple reports.
+        years_dict = record.get("years") or {}
+        for y_key, slot in years_dict.items():
+            if standardize_fy(y_key) == target_std and _slot_has_data(slot):
+                return slot
+        return None
 
-    # 2. Check explicit matching FY on the slots
+    # 2. Check explicit matching FY on the slots when report is not provided
     if cur_fy == target_std and _slot_has_data(cur_slot):
         return cur_slot
     if prev_fy == target_std and _slot_has_data(prev_slot):
@@ -1017,19 +1042,190 @@ def get_kpi_slot_for_fy(record: dict, target_fy: str, report: dict | None = None
     return None
 
 
-def get_kpi_value_for_fy(record: dict, target_fy: str, report: dict | None = None) -> str:
-    """Returns human-readable formatted string for a specific financial year, or empty string '' if unavailable."""
+def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | str:
+    """
+    Extracts strictly the numeric metric value for a KPI slot.
+    Returns int or float if a numeric value is present.
+    If no numeric metric value is found, returns 'Not Found'.
+    """
+    if not slot or not isinstance(slot, dict):
+        return "Not Found"
+
+    kid = (record.get("kpi_id") or "").strip().upper()
+    kpi_meta = KPI_BY_ID.get(kid, {})
+    unit_kind = kpi_meta.get("unit_kind")
+
+    # 1. Direct numeric value in slot
+    if slot.get("value") is not None:
+        n = to_number(slot["value"])
+        if n is not None:
+            if float(n).is_integer():
+                return int(n)
+            return round(float(n), 4)
+
+    comps = slot.get("components") or {}
+
+    # 2. Key KPI component resolution
+    if kid == "S1":
+        # Workforce Headcount: employees + workers
+        e = to_number(comps.get("employees"))
+        w = to_number(comps.get("workers"))
+        if e is not None or w is not None:
+            tot = (e or 0) + (w or 0)
+            return int(tot) if float(tot).is_integer() else tot
+
+    elif kid == "S2":
+        # Workplace Fatalities: employees + workers (can be 0)
+        e = to_number(comps.get("employees"))
+        w = to_number(comps.get("workers"))
+        if e is not None or w is not None:
+            tot = (e or 0) + (w or 0)
+            return int(tot) if float(tot).is_integer() else tot
+
+    elif kid == "S6":
+        # Gender Diversity: female_pct
+        fp = to_number(comps.get("female_pct"))
+        if fp is not None:
+            return int(fp) if float(fp).is_integer() else round(float(fp), 4)
+
+    elif kid == "S10":
+        # POSH Complaints: filed count (fallback resolved)
+        f = to_number(comps.get("filed"))
+        if f is not None:
+            return int(f) if float(f).is_integer() else f
+        res = to_number(comps.get("resolved"))
+        if res is not None:
+            return int(res) if float(res).is_integer() else res
+
+    elif kid == "S11":
+        # Customer Complaints: received count (fallback resolved)
+        rec = to_number(comps.get("received"))
+        if rec is not None:
+            return int(rec) if float(rec).is_integer() else rec
+        res = to_number(comps.get("resolved"))
+        if res is not None:
+            return int(res) if float(res).is_integer() else res
+
+    elif kid == "S12":
+        # CSR Budget: spent (Rs. crore) or budgeted
+        sp = to_number(comps.get("spent"))
+        if sp is not None:
+            return int(sp) if float(sp).is_integer() else round(float(sp), 4)
+        bg = to_number(comps.get("budgeted"))
+        if bg is not None:
+            return int(bg) if float(bg).is_integer() else round(float(bg), 4)
+
+    elif kid == "G3":
+        # Independent Directors: count or pct
+        c = to_number(comps.get("count"))
+        if c is not None:
+            return int(c) if float(c).is_integer() else c
+        pct = to_number(comps.get("pct"))
+        if pct is not None:
+            return int(pct) if float(pct).is_integer() else round(float(pct), 4)
+
+    elif kid == "F1":
+        # Revenue
+        rev = to_number(comps.get("revenue"))
+        if rev is not None:
+            return int(rev) if float(rev).is_integer() else round(float(rev), 4)
+
+    elif kid == "F2":
+        # Green Capex
+        gc = to_number(comps.get("green_capex"))
+        if gc is not None:
+            return int(gc) if float(gc).is_integer() else round(float(gc), 4)
+        gp = to_number(comps.get("green_pct"))
+        if gp is not None:
+            return int(gp) if float(gp).is_integer() else round(float(gp), 4)
+
+    # 3. Qualitative / Text KPIs have no numeric metric value
+    if unit_kind == "text":
+        return "Not Found"
+
+    # 4. Check any numeric component for non-text KPIs
+    for v in comps.values():
+        n = to_number(v)
+        if n is not None:
+            if float(n).is_integer():
+                return int(n)
+            return round(float(n), 4)
+
+    # 5. Check inputs if slot had inputs
+    inputs = slot.get("inputs") or {}
+    for inp in inputs.values():
+        if isinstance(inp, dict) and inp.get("value") is not None:
+            n = to_number(inp["value"])
+            if n is not None:
+                if float(n).is_integer():
+                    return int(n)
+                return round(float(n), 4)
+
+    return "Not Found"
+
+
+def get_kpi_value_for_fy(record: dict, target_fy: str, report: dict | None = None, numeric_only: bool = True) -> float | int | str:
+    """Returns numeric metric value for a specific financial year, or 'Not Found' if unavailable."""
     slot = get_kpi_slot_for_fy(record, target_fy, report)
     if not slot:
-        return ""
+        return "Not Found"
+    if numeric_only:
+        return extract_numeric_kpi_value(record, slot)
     val = format_year(slot)
-    return val if val else ""
+    return val if val else "Not Found"
+
+
+def get_kpi_page_citation(record: dict, years: list[str], report: dict | None = None) -> str:
+    """
+    Builds the trailing page verification citation string across the displayed financial years,
+    formatted as: 'FY24 data page 60, FY25 data page 70'.
+    Only cites pages for years that have valid numeric metric data.
+    If no data is found for any year, returns 'Not Found'.
+    """
+    if not record:
+        return "Not Found"
+
+    active_year_slots = []
+    for fy in years:
+        val = get_kpi_value_for_fy(record, fy, report)
+        if val != "Not Found":
+            slot = get_kpi_slot_for_fy(record, fy, report)
+            active_year_slots.append((fy, slot))
+
+    if not active_year_slots:
+        return "Not Found"
+
+    rec_pages = list(record.get("pages") or [])
+    citations = []
+
+    for idx, (fy, slot) in enumerate(active_year_slots):
+        m = re.search(r"(\d\d)$", fy)
+        short_fy = f"FY{m.group(1)}" if m else fy
+
+        pages = []
+        if slot and slot.get("pages"):
+            pages = [p for p in slot["pages"] if p is not None]
+        elif rec_pages:
+            if len(rec_pages) == 1:
+                pages = rec_pages
+            elif len(rec_pages) == len(active_year_slots):
+                pages = [rec_pages[idx]]
+            else:
+                pages = rec_pages
+
+        if pages:
+            unique_pages = sorted(set(int(p) for p in pages if to_number(p) is not None))
+            if unique_pages:
+                page_str = ", ".join(str(p) for p in unique_pages)
+                citations.append(f"{short_fy} data page {page_str}")
+
+    return ", ".join(citations) if citations else ""
 
 
 def company_multi_year_frame(report: dict, years: list[str] | None = None):
     """
     Returns a DataFrame in the format:
-    S. No. | Unit | Env./Social/Gov. | KPI | FY2024 | FY2025 | FY2026 ...
+    S. No. | Unit | Env./Social/Gov. | KPI | FY2024 | FY2025 | FY2026 ... | Source Page(s)
     """
     import pandas as pd
     kpis = (report or {}).get("kpis") or []
@@ -1055,7 +1251,7 @@ def company_multi_year_frame(report: dict, years: list[str] | None = None):
                     found_years.add(std)
 
     if years:
-        all_years = sorted(set(years))
+        all_years = sorted(set(standardize_fy(y) or y for y in years if standardize_fy(y) or y))
     else:
         base = {"FY2024", "FY2025", "FY2026"}
         all_years = sorted(base.union(found_years))
@@ -1073,6 +1269,7 @@ def company_multi_year_frame(report: dict, years: list[str] | None = None):
         }
         for fy in all_years:
             row[fy] = get_kpi_value_for_fy(r, fy, report)
+        row["Source Page(s)"] = get_kpi_page_citation(r, all_years, report)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1083,6 +1280,7 @@ def comparative_analysis_frame(reports: list[dict], target_fy: str = "FY2026"):
     S. No. | KPI Name | Unit | Company 1 | Company 2 | Company 3 ...
     """
     import pandas as pd
+    target_fy_std = standardize_fy(target_fy) or target_fy
     ready = [r for r in reports if report_ready(r)]
     by_company = []
     for rep in ready:
@@ -1101,26 +1299,9 @@ def comparative_analysis_frame(reports: list[dict], target_fy: str = "FY2026"):
         for c_name, rep, by_id in by_company:
             rec = by_id.get(kid)
             if not rec:
-                row[c_name] = ""
+                row[c_name] = "Not Found"
             else:
-                row[c_name] = get_kpi_value_for_fy(rec, target_fy, rep)
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-    rows = []
-    for kpi in KPI_CATALOG:
-        kid = kpi["id"]
-        row = {
-            "S. No.": kid,
-            "KPI Name": kpi["name"],
-            "Unit": kpi["required_unit"],
-        }
-        for c_name, rep, by_id in by_company:
-            rec = by_id.get(kid)
-            if not rec:
-                row[c_name] = "—"
-            else:
-                row[c_name] = get_kpi_value_for_fy(rec, target_fy, rep)
+                row[c_name] = get_kpi_value_for_fy(rec, target_fy_std, rep)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1149,10 +1330,11 @@ def export_excel_workbook(reports: list[dict], target_fy: str = "FY2026") -> byt
     import io
     import pandas as pd
 
+    target_fy_std = standardize_fy(target_fy) or target_fy
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        comp_df = comparative_analysis_frame(reports, target_fy=target_fy)
-        comp_sheet = f"Comparative_{target_fy}"[:31]
+        comp_df = comparative_analysis_frame(reports, target_fy=target_fy_std)
+        comp_sheet = f"Comparative_{target_fy_std}"[:31]
         comp_df.to_excel(writer, sheet_name=comp_sheet, index=False)
 
         all_multi = consolidated_multi_year_frame(reports)

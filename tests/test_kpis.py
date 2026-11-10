@@ -193,7 +193,7 @@ def test_standardize_fy():
 def test_component_and_text_kpi_year_slots():
     from kpis import company_multi_year_frame
     _, records = run([
-        {"kpi_id": "E1", "current": {"fy": "FY 2025-26", "value": 97.5}, "previous": {"fy": "FY 2024-25", "value": 96.98}},
+        {"kpi_id": "E1", "current": {"fy": "FY 2025-26", "value": 97.5}, "previous": {"fy": "FY 2024-25", "value": 96.98}, "pages": [60, 70]},
         {"kpi_id": "S2", "current": {"components": {"employees": 0, "workers": 0}},
                         "previous": {"components": {"employees": 0, "workers": 0}}},
         {"kpi_id": "S10", "current": {"components": {"filed": 11, "resolved": 11, "pending": 0}},
@@ -203,32 +203,40 @@ def test_component_and_text_kpi_year_slots():
     ])
     report = {"name": "BRSR26 HUL", "kpis": records}
     df = company_multi_year_frame(report)
-    
-    # S2 must be populated for FY2026 and FY2025
+
+    # S2 must be numeric 0 for FY2026 and FY2025, and 'Not Found' for unpopulated FY2024
     s2_row = df[df["S. No."] == "S2"].iloc[0]
-    assert "employees 0" in s2_row["FY2026"]
-    assert "employees 0" in s2_row["FY2025"]
-    assert s2_row["FY2024"] == ""  # Not disclosed in FY2024 report
+    assert s2_row["FY2026"] == 0
+    assert s2_row["FY2025"] == 0
+    assert s2_row["FY2024"] == "Not Found"
 
-    # S10 must be populated
+    # S10 must be numeric 11 and 7
     s10_row = df[df["S. No."] == "S10"].iloc[0]
-    assert "filed 11" in s10_row["FY2026"]
-    assert "filed 7" in s10_row["FY2025"]
+    assert s10_row["FY2026"] == 11
+    assert s10_row["FY2025"] == 7
+    assert s10_row["FY2024"] == "Not Found"
 
-    # E4 Scope 3 must be populated under FY2026 and FY2025
+    # E4 Scope 3 must be numeric
     e4_row = df[df["S. No."] == "E4"].iloc[0]
-    assert "10,535,856" in e4_row["FY2026"] or "10535856" in e4_row["FY2026"]
-    assert "9,962,535" in e4_row["FY2025"] or "9962535" in e4_row["FY2025"]
+    assert e4_row["FY2026"] == 10535856
+    assert e4_row["FY2025"] == 9962535
+    assert e4_row["FY2024"] == "Not Found"
+
+    # E1 Source Page(s) verification citation
+    e1_row = df[df["S. No."] == "E1"].iloc[0]
+    assert "FY25 data page 60" in e1_row["Source Page(s)"]
+    assert "FY26 data page 70" in e1_row["Source Page(s)"]
 
     # Ghost columns must NOT exist
     assert "FYJAN" not in "".join(df.columns)
 
 
 def test_company_multi_year_frame_and_comparative():
-    from kpis import company_multi_year_frame, comparative_analysis_frame, export_excel_workbook
+    from kpis import company_multi_year_frame, comparative_analysis_frame, consolidated_multi_year_frame, export_excel_workbook
     _, records = run([
         {"kpi_id": "E1", "current": {"fy": "FY 2024-25", "value": 31.0, "unit": "%"},
-                        "previous": {"fy": "FY 2023-24", "value": 24.5, "unit": "%"}},
+                        "previous": {"fy": "FY 2023-24", "value": 24.5, "unit": "%"},
+                        "pages": [40, 50]},
         {"kpi_id": "E2", "current": {"fy": "FY 2024-25", "value": 120.0, "unit": "MJ per Rs. crore"},
                         "previous": {"fy": "FY 2023-24", "value": 130.0, "unit": "MJ per Rs. crore"}},
     ])
@@ -241,6 +249,15 @@ def test_company_multi_year_frame_and_comparative():
     assert "FY2024" in df_multi.columns
     assert "FY2025" in df_multi.columns
     assert "FY2026" in df_multi.columns
+    assert "Source Page(s)" in df_multi.columns
+
+    # Verify numeric values and Not Found
+    e1_row = df_multi[df_multi["S. No."] == "E1"].iloc[0]
+    assert e1_row["FY2024"] == 24.5
+    assert e1_row["FY2025"] == 31.0
+    assert e1_row["FY2026"] == "Not Found"
+    assert "FY24 data page 40" in e1_row["Source Page(s)"]
+    assert "FY25 data page 50" in e1_row["Source Page(s)"]
 
     # Comparative analysis frame
     comp_df = comparative_analysis_frame([report], target_fy="FY2025")
@@ -249,8 +266,70 @@ def test_company_multi_year_frame_and_comparative():
     assert "Unit" in comp_df.columns
     assert "Acme Corp" in comp_df.columns
     e1_row = comp_df[comp_df["S. No."] == "E1"].iloc[0]
-    assert "31" in str(e1_row["Acme Corp"])
+    assert e1_row["Acme Corp"] == 31.0
+
+    # Unpopulated KPI in comparative analysis must be 'Not Found'
+    e10_row = comp_df[comp_df["S. No."] == "E10"].iloc[0]
+    assert e10_row["Acme Corp"] == "Not Found"
+
+    # Consolidated multi-year table
+    consol_df = consolidated_multi_year_frame([report])
+    assert consol_df.columns[0] == "Company"
+    assert consol_df.columns[-1] == "Source Page(s)"
+    assert consol_df["Company"].iloc[0] == "Acme Corp"
 
     # Excel export
     excel_bytes = export_excel_workbook([report], target_fy="FY2025")
     assert len(excel_bytes) > 1000
+
+
+def test_extract_numeric_kpi_value_and_edge_cases():
+    from kpis import extract_numeric_kpi_value
+
+    # Direct floats and integers
+    assert extract_numeric_kpi_value({"kpi_id": "E1"}, {"value": 96.98}) == 96.98
+    assert extract_numeric_kpi_value({"kpi_id": "E2"}, {"value": "57,700"}) == 57700
+    assert extract_numeric_kpi_value({"kpi_id": "E3"}, {"value": 0.15}) == 0.15
+
+    # Fatalities 0 must be 0, never 'Not Found'
+    assert extract_numeric_kpi_value({"kpi_id": "S2"}, {"components": {"employees": 0, "workers": 0}}) == 0
+    assert extract_numeric_kpi_value({"kpi_id": "S2"}, {"value": 0}) == 0
+
+    # Components
+    assert extract_numeric_kpi_value({"kpi_id": "S1"}, {"components": {"employees": 10000, "workers": 7699}}) == 17699
+    assert extract_numeric_kpi_value({"kpi_id": "S6"}, {"components": {"female_pct": 17.38, "male_pct": 82.62}}) == 17.38
+    assert extract_numeric_kpi_value({"kpi_id": "S10"}, {"components": {"filed": 11, "resolved": 11, "pending": 0}}) == 11
+    assert extract_numeric_kpi_value({"kpi_id": "S11"}, {"components": {"received": 4, "resolved": 4}}) == 4
+    assert extract_numeric_kpi_value({"kpi_id": "S12"}, {"components": {"spent": 25.6, "budgeted": 25.0}}) == 25.6
+    assert extract_numeric_kpi_value({"kpi_id": "G3"}, {"components": {"count": 6, "pct": 50.0}}) == 6
+    assert extract_numeric_kpi_value({"kpi_id": "F1"}, {"components": {"revenue": 60000, "ebitda": 14000, "pat": 10000}}) == 60000
+
+    # Text / Qualitative KPIs return 'Not Found'
+    assert extract_numeric_kpi_value({"kpi_id": "E10"}, {"components": {"status": "Yes", "target_year": "2040"}}) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "E11"}, {"text": "Alliance for Water Stewardship"}) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "G5"}, {"components": {"status": "Yes"}}) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "G7"}, {"components": {"status": "Yes"}}) == "Not Found"
+
+    # Empty slots return 'Not Found'
+    assert extract_numeric_kpi_value({"kpi_id": "E1"}, None) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "E1"}, {}) == "Not Found"
+
+
+def test_trailing_page_citations():
+    from kpis import get_kpi_page_citation
+
+    # When slot pages are present
+    rec = {
+        "kpi_id": "E1",
+        "current": {"fy": "FY 2024-25", "value": 31.0, "pages": [70]},
+        "previous": {"fy": "FY 2023-24", "value": 24.5, "pages": [60]},
+        "pages": [60, 70],
+    }
+    citation = get_kpi_page_citation(rec, ["FY2024", "FY2025", "FY2026"])
+    assert "FY24 data page 60" in citation
+    assert "FY25 data page 70" in citation
+    assert "FY26" not in citation  # Not Found year is not cited
+
+    # Undisclosed KPI returns 'Not Found'
+    empty_rec = {"kpi_id": "E1", "current": {}, "previous": {}, "pages": []}
+    assert get_kpi_page_citation(empty_rec, ["FY2024", "FY2025", "FY2026"]) == "Not Found"

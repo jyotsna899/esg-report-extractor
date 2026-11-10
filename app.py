@@ -1572,7 +1572,7 @@ def render_compare_tab():
         )
 
     st.dataframe(comp_df, width="stretch", hide_index=True)
-    st.caption(f"Showing KPIs across all companies for {selected_fy}. Columns: S. No. | KPI Name | Unit | [Companies]. '—' indicates not disclosed for that financial year.")
+    st.caption(f"Showing KPIs across all companies for {selected_fy}. Columns: S. No. | KPI Name | Unit | [Companies]. 'Not Found' indicates not disclosed for that financial year.")
 
     st.subheader("Look up one KPI")
     options = [f"{k['id']} — {k['name']}" for k in KPI_CATALOG]
