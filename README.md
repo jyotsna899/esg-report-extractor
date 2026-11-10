@@ -86,6 +86,23 @@ One record per KPI:
 `not_disclosed`. Composite KPIs (e.g. S10 POSH complaints, F1
 revenue/EBITDA/PAT) put their parts in `components`.
 
+## Output Formats & Comparison Tables
+
+1. **Company Multi-Year Historical Trend Table**:
+   `S. No. | Unit | Env./Social/Gov. | KPI | FY2024 | FY2025 | FY2026 ...`
+   Enables side-by-side KPI comparison of a company across multiple Financial Years.
+
+2. **Comparative Analysis Table (FY2026 / Selected FY)**:
+   `S. No. | KPI Name | Unit | Company 1 | Company 2 | Company 3 ...`
+   Enables side-by-side KPI benchmarking across multiple companies for a specific financial year.
+
+3. **Multi-Sheet Excel Workbook (`.xlsx`) & CSV Exports**:
+   - Multi-sheet Excel workbook (`.xlsx`) containing:
+     - Sheet 1: `Comparative Analysis ({target_fy})`
+     - Sheet 2: `All Companies Consolidated Multi-Year Trend`
+     - Subsequent Sheets: Per-company multi-year breakdown tabs
+   - Direct CSV exports for both individual company multi-year tables and cross-company comparative tables, plus bulk ZIP download.
+
 ## Tests
 
 ```bash
@@ -94,6 +111,5 @@ python -m pytest tests/
 
 ## Next steps / possible extensions
 
-- Trend tracking across more than two years from repeat report uploads
 - Confidence scoring on extracted values
 - Table extraction (pdfplumber tables) for reports with heavy tabular data

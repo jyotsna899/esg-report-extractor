@@ -795,6 +795,17 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
         rec["status"] = status
         rec["year_status"] = ys
         rec["derivation"] = "; ".join(notes) if notes else None
+        years_map = {}
+        for y in YEARS:
+            fy_label = standardize_fy(slots[y].get("fy"))
+            if fy_label:
+                years_map[fy_label] = dict(slots[y])
+        if raw.get("years") and isinstance(raw["years"], dict):
+            for k, v in raw["years"].items():
+                std_k = standardize_fy(k)
+                if std_k and std_k not in years_map:
+                    years_map[std_k] = v
+        rec["years"] = years_map
         out.append(rec)
     return out
 
@@ -885,3 +896,224 @@ def report_ready(report: dict) -> bool:
 def is_legacy_report(report: dict) -> bool:
     """Saved before the fixed-KPI schema: has free-form metrics but no KPI records."""
     return bool((report or {}).get("metrics")) and not (report or {}).get("kpis")
+
+
+# ---------------------------------------------------------------------
+# Multi-year formatting & Excel/CSV export helpers
+# ---------------------------------------------------------------------
+def standardize_fy(raw: str | None) -> str:
+    """Standardizes financial year strings like 'FY 2024-25', '2024-25', 'FY25' into 'FY2025'."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    m = re.search(r"(?:FY\s*)?(\d{2,4})\s*[-/]\s*(\d{2,4})", s, re.IGNORECASE)
+    if m:
+        end_yr = m.group(2)
+        if len(end_yr) == 2:
+            return f"FY20{end_yr}"
+        elif len(end_yr) == 4:
+            return f"FY{end_yr}"
+    m = re.search(r"FY\s*(\d{2,4})", s, re.IGNORECASE)
+    if m:
+        yr = m.group(1)
+        if len(yr) == 2:
+            return f"FY20{yr}"
+        elif len(yr) == 4:
+            return f"FY{yr}"
+    m = re.search(r"\b(20\d\d)\b", s)
+    if m:
+        return f"FY{m.group(1)}"
+    clean = re.sub(r"\s+", "", s).upper()
+    return clean if clean.startswith("FY") else f"FY{clean}"
+
+
+def extract_report_dominant_years(report: dict) -> tuple[str, str]:
+    """Infers the primary current and previous FY for a report from its disclosed KPIs."""
+    cur_counts = {}
+    prev_counts = {}
+    for r in (report or {}).get("kpis") or []:
+        c_fy = standardize_fy((r.get("current") or {}).get("fy"))
+        p_fy = standardize_fy((r.get("previous") or {}).get("fy"))
+        if c_fy:
+            cur_counts[c_fy] = cur_counts.get(c_fy, 0) + 1
+        if p_fy:
+            prev_counts[p_fy] = prev_counts.get(p_fy, 0) + 1
+    dom_cur = max(cur_counts, key=cur_counts.get) if cur_counts else "FY2025"
+    dom_prev = max(prev_counts, key=prev_counts.get) if prev_counts else "FY2024"
+    return dom_cur, dom_prev
+
+
+def get_kpi_slot_for_fy(record: dict, target_fy: str, report: dict | None = None):
+    """Finds the data slot (value, unit, components, etc.) for a specific financial year."""
+    if not record:
+        return None
+    target_std = standardize_fy(target_fy)
+    if not target_std:
+        return None
+
+    # Check explicit 'years' dictionary if present
+    years_dict = record.get("years") or {}
+    for y_key, slot in years_dict.items():
+        if standardize_fy(y_key) == target_std and slot:
+            return slot
+
+    # Check current year slot
+    cur_slot = record.get("current") or {}
+    cur_fy = standardize_fy(cur_slot.get("fy"))
+    if cur_fy == target_std:
+        return cur_slot
+
+    # Check previous year slot
+    prev_slot = record.get("previous") or {}
+    prev_fy = standardize_fy(prev_slot.get("fy"))
+    if prev_fy == target_std:
+        return prev_slot
+
+    # Fallback to dominant report years if slot has no explicit FY string
+    if report:
+        dom_cur, dom_prev = extract_report_dominant_years(report)
+        if target_std == dom_cur and not cur_fy and cur_slot.get("value") is not None:
+            return cur_slot
+        if target_std == dom_prev and not prev_fy and prev_slot.get("value") is not None:
+            return prev_slot
+
+    return None
+
+
+def get_kpi_value_for_fy(record: dict, target_fy: str, report: dict | None = None) -> str:
+    """Returns human-readable formatted string for a specific financial year, or '—' if unavailable."""
+    slot = get_kpi_slot_for_fy(record, target_fy, report)
+    if not slot:
+        return "—"
+    val = format_year(slot)
+    return val if val else "—"
+
+
+def company_multi_year_frame(report: dict, years: list[str] | None = None):
+    """
+    Returns a DataFrame in the format:
+    S. No. | Unit | Env./Social/Gov. | KPI | FY2024 | FY2025 | FY2026 ...
+    """
+    import pandas as pd
+    kpis = (report or {}).get("kpis") or []
+    
+    # Collect all available years
+    found_years = set()
+    for r in kpis:
+        for slot in (r.get("current"), r.get("previous")):
+            if slot and slot.get("fy"):
+                std = standardize_fy(slot.get("fy"))
+                if std:
+                    found_years.add(std)
+        for y_key in (r.get("years") or {}).keys():
+            std = standardize_fy(y_key)
+            if std:
+                found_years.add(std)
+                
+    dom_cur, dom_prev = extract_report_dominant_years(report)
+    if dom_cur:
+        found_years.add(dom_cur)
+    if dom_prev:
+        found_years.add(dom_prev)
+
+    base_years = list(years) if years else ["FY2024", "FY2025", "FY2026"]
+    all_years = sorted(set(base_years).union(found_years))
+
+    rows = []
+    for r in kpis:
+        cur_unit = (r.get("current") or {}).get("unit")
+        prev_unit = (r.get("previous") or {}).get("unit")
+        unit = cur_unit or prev_unit or r.get("required_unit") or ""
+        row = {
+            "S. No.": r["kpi_id"],
+            "Unit": unit,
+            "Env./Social/Gov.": r["category"],
+            "KPI": r["kpi_name"],
+        }
+        for fy in all_years:
+            row[fy] = get_kpi_value_for_fy(r, fy, report)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def comparative_analysis_frame(reports: list[dict], target_fy: str = "FY2026"):
+    """
+    Returns a DataFrame in the format:
+    S. No. | KPI Name | Unit | Company 1 | Company 2 | Company 3 ...
+    """
+    import pandas as pd
+    ready = [r for r in reports if report_ready(r)]
+    by_company = []
+    for rep in ready:
+        c_name = rep.get("name", "Unknown")
+        by_id = {r["kpi_id"]: r for r in rep.get("kpis", [])}
+        by_company.append((c_name, rep, by_id))
+
+    rows = []
+    for kpi in KPI_CATALOG:
+        kid = kpi["id"]
+        row = {
+            "S. No.": kid,
+            "KPI Name": kpi["name"],
+            "Unit": kpi["required_unit"],
+        }
+        for c_name, rep, by_id in by_company:
+            rec = by_id.get(kid)
+            if not rec:
+                row[c_name] = "—"
+            else:
+                row[c_name] = get_kpi_value_for_fy(rec, target_fy, rep)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def consolidated_multi_year_frame(reports: list[dict], years: list[str] | None = None):
+    """Returns a consolidated multi-year DataFrame across all ready companies."""
+    import pandas as pd
+    frames = []
+    ready = [r for r in reports if report_ready(r)]
+    for rep in ready:
+        df = company_multi_year_frame(rep, years=years)
+        df.insert(0, "Company", rep.get("name", "Unknown"))
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def export_excel_workbook(reports: list[dict], target_fy: str = "FY2026") -> bytes:
+    """
+    Exports a multi-sheet Excel workbook (.xlsx):
+      - Sheet 1: Comparative Analysis for target_fy
+      - Sheet 2: Consolidated Multi-Year table for all companies
+      - Subsequent Sheets: Per-company multi-year breakdown
+    """
+    import io
+    import pandas as pd
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        comp_df = comparative_analysis_frame(reports, target_fy=target_fy)
+        comp_sheet = f"Comparative_{target_fy}"[:31]
+        comp_df.to_excel(writer, sheet_name=comp_sheet, index=False)
+
+        all_multi = consolidated_multi_year_frame(reports)
+        if not all_multi.empty:
+            all_multi.to_excel(writer, sheet_name="All_Companies_MultiYear"[:31], index=False)
+
+        used_sheets = {comp_sheet.lower(), "all_companies_multiyear"}
+        for rep in reports:
+            if not report_ready(rep):
+                continue
+            c_name = rep.get("name", "Company")
+            c_df = company_multi_year_frame(rep)
+            base_sheet = re.sub(r"[^\w\s-]", "", c_name).strip()[:28] or "Company"
+            sheet_title = base_sheet
+            suffix = 2
+            while sheet_title.lower() in used_sheets:
+                sheet_title = f"{base_sheet[:25]}_{suffix}"
+                suffix += 1
+            used_sheets.add(sheet_title.lower())
+            c_df.to_excel(writer, sheet_name=sheet_title, index=False)
+
+    return output.getvalue()

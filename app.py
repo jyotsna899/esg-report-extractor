@@ -49,22 +49,32 @@ from kpis import (
     CATEGORIES,
     KPI_BY_ID,
     KPI_CATALOG,
+    company_multi_year_frame,
+    comparative_analysis_frame,
+    consolidated_multi_year_frame,
     coverage as kpi_coverage,
+    export_excel_workbook,
+    extract_report_dominant_years,
     format_year,
+    get_kpi_value_for_fy,
     headline_value,
     is_disclosed,
     is_legacy_report,
     report_ready,
+    standardize_fy,
     yoy_change,
 )
 from pipeline import extract_one_pdf
 from runtime import apply_streamlit_secrets, is_streamlit_cloud
 from store import (
+    clear_all_reports,
     clear_pending_job,
     data_dir,
     job_input_dir,
     load_job,
     load_pending_job,
+    load_report_page_map,
+    load_report_text,
     load_reports,
     mark_pending_item_done,
     remaining_pending_items,
@@ -119,11 +129,26 @@ _sync_reports()
 def _job_process_alive(pid):
     if not pid:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            STILL_ACTIVE = 259
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            success = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+            return bool(success and exit_code.value == STILL_ACTIVE)
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
 
 
 def _job_is_running(job):
@@ -264,7 +289,12 @@ def _combined_kpi_csv(reports: list[dict]) -> str:
     return pd.concat(frames, ignore_index=True).to_csv(index=False)
 
 
-def _reports_csv_zip(reports: list[dict]) -> bytes:
+def _combined_multi_year_csv(reports: list[dict]) -> str:
+    df = consolidated_multi_year_frame(reports)
+    return "" if df.empty else df.to_csv(index=False)
+
+
+def _reports_csv_zip(reports: list[dict], target_fy: str = "FY2026") -> bytes:
     buf = io.BytesIO()
     used = set()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -272,16 +302,27 @@ def _reports_csv_zip(reports: list[dict]) -> bytes:
             if not report_ready(report):
                 continue
             stem = _safe_download_stem(report["name"])
-            filename = f"{stem}.csv"
+            filename = f"{stem}_multi_year.csv"
             n = 2
             while filename in used:
-                filename = f"{stem}_{n}.csv"
+                filename = f"{stem}_multi_year_{n}.csv"
                 n += 1
             used.add(filename)
-            archive.writestr(filename, kpi_frame(report["kpis"]).to_csv(index=False))
-        combined = _combined_kpi_csv(reports)
-        if combined:
-            archive.writestr("all_companies.csv", combined)
+            archive.writestr(filename, company_multi_year_frame(report).to_csv(index=False))
+        # Add Comparative Analysis CSV
+        comp_df = comparative_analysis_frame(reports, target_fy=target_fy)
+        if not comp_df.empty:
+            archive.writestr(f"comparative_analysis_{target_fy}.csv", comp_df.to_csv(index=False))
+        # Add Consolidated Multi-Year CSV
+        all_df = consolidated_multi_year_frame(reports)
+        if not all_df.empty:
+            archive.writestr("all_companies_multi_year.csv", all_df.to_csv(index=False))
+        # Add Excel Workbook
+        try:
+            excel_bytes = export_excel_workbook(reports, target_fy=target_fy)
+            archive.writestr("ESG_Analysis_Workbook.xlsx", excel_bytes)
+        except Exception:
+            pass
     return buf.getvalue()
 
 
@@ -344,7 +385,7 @@ def _merged_chat_context(reports: list[dict]):
     texts = []
     next_page = 1
     for report in reports:
-        local_map = report.get("page_map") or {}
+        local_map = load_report_page_map(report)
         remap = {}
         for page in sorted(local_map):
             remap[page] = next_page
@@ -357,7 +398,8 @@ def _merged_chat_context(reports: list[dict]):
                 "pages": [remap[page] for page in entry.get("pages", []) if page in remap],
             })
         kpis.extend(report.get("kpis") or [])
-        texts.append(f"\n\n===== {report['name']} =====\n\n{report.get('full_text') or ''}")
+        rep_text = load_report_text(report)
+        texts.append(f"\n\n===== {report['name']} =====\n\n{rep_text}")
     return kpis, topic_index, page_map, "\n".join(texts)
 
 
@@ -644,39 +686,51 @@ def render_results_overview(reports: list[dict]):
         )
 
     ready = [report for report in reports if report_ready(report)]
-    download_col, zip_col, clear_col = st.columns(3)
-    with download_col:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        if ready:
+            excel_bytes = export_excel_workbook(ready, target_fy="FY2026")
+            st.download_button(
+                "📥 Download Excel Workbook (.xlsx)",
+                excel_bytes,
+                file_name="ESG_Analysis_Workbook.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_excel_workbook_all",
+            )
+    with c2:
         if ready:
             st.download_button(
-                "Download combined CSV",
-                _combined_kpi_csv(ready),
-                file_name="esg_kpis_all_companies.csv",
+                "📥 Download Consolidated Multi-Year CSV",
+                _combined_multi_year_csv(ready),
+                file_name="ESG_All_Companies_MultiYear.csv",
                 mime="text/csv",
                 key="dl_combined_csv",
             )
-    with zip_col:
+    with c3:
         if ready:
             st.download_button(
-                "Download all CSVs (zip)",
+                "📥 Download All Reports (ZIP)",
                 _reports_csv_zip(ready),
-                file_name="esg_kpi_csvs.zip",
+                file_name="ESG_Reports_Package.zip",
                 mime="application/zip",
                 key="dl_csv_zip",
             )
-    with clear_col:
-        if st.button("Clear reports"):
+    with c4:
+        if st.button("🗑️ Clear reports"):
             clear_pending_job()
+            clear_all_reports()
             _persist_reports([])
             save_job(status="idle", message="", progress=0.0, pid=None, ready_count=0, total_count=0, current_index=0, error=None)
             st.rerun()
 
     if ready:
-        with st.expander("Download one CSV per company"):
+        with st.expander("Download Multi-Year CSV per company"):
             for index, report in enumerate(ready):
+                c_multi_df = company_multi_year_frame(report)
                 st.download_button(
-                    f"CSV — {report['name']}",
-                    kpi_frame(report["kpis"]).to_csv(index=False),
-                    file_name=f"{_safe_download_stem(report['name'])}_kpis.csv",
+                    f"CSV — {report['name']} (Multi-Year)",
+                    c_multi_df.to_csv(index=False),
+                    file_name=f"{_safe_download_stem(report['name'])}_multi_year.csv",
                     mime="text/csv",
                     key=f"dl_one_{index}_{_safe_download_stem(report['name'])}",
                 )
@@ -700,25 +754,49 @@ DETAIL_COLUMNS = ["ID", "KPI", "Current FY", "Current", "Previous FY", "Previous
 def render_detail_tab(name: str, data: dict):
     kpis = data["kpis"]
     df = kpi_frame(kpis)
+    multi_df = company_multi_year_frame(data)
     cov = kpi_coverage(kpis)
 
-    st.subheader(f"{name} — {cov['disclosed']}/{cov['total']} KPIs disclosed")
+    st.subheader(f"{name} — Multi-Year KPI Trend")
     st.caption(
-        f"{cov['derived']} of these are **derived** (unit-converted or computed from figures the report "
-        "states); the Derivation column shows the formula. Everything else is copied as printed."
+        f"{cov['disclosed']}/{cov['total']} KPIs disclosed ({cov['derived']} derived). "
+        "Side-by-side historical comparison across financial years."
     )
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        st.download_button("Download CSV", df.to_csv(index=False), file_name=f"{name}_kpis.csv", key=f"dl_csv_{name}")
+        st.download_button(
+            "📥 Download Multi-Year CSV",
+            multi_df.to_csv(index=False),
+            file_name=f"{_safe_download_stem(name)}_multi_year.csv",
+            mime="text/csv",
+            key=f"dl_multi_csv_{name}"
+        )
     with col2:
-        st.download_button("Download JSON", json.dumps(kpis, indent=2), file_name=f"{name}_kpis.json", key=f"dl_json_{name}")
+        st.download_button(
+            "📥 Download Standard CSV",
+            df.to_csv(index=False),
+            file_name=f"{_safe_download_stem(name)}_kpis.csv",
+            mime="text/csv",
+            key=f"dl_csv_{name}"
+        )
+    with col3:
+        st.download_button(
+            "📥 Download JSON",
+            json.dumps(kpis, indent=2),
+            file_name=f"{_safe_download_stem(name)}_kpis.json",
+            mime="application/json",
+            key=f"dl_json_{name}"
+        )
+
+    # Show primary Multi-Year Table requested by the user
+    st.dataframe(multi_df, width="stretch", hide_index=True)
 
     for cat in CATEGORIES:
-        cat_df = df[df["Category"] == cat]
+        cat_multi_df = multi_df[multi_df["Env./Social/Gov."] == cat]
         n = cov["by_category"][cat]
-        with st.expander(f"{cat} — {n}/{cov['category_totals'][cat]} disclosed", expanded=True):
-            st.dataframe(cat_df[DETAIL_COLUMNS], width="stretch", hide_index=True)
+        with st.expander(f"{cat} Breakdown — {n}/{cov['category_totals'][cat]} disclosed", expanded=False):
+            st.dataframe(cat_multi_df, width="stretch", hide_index=True)
 
     derived_rows = df[df["Derivation"] != ""]
     if not derived_rows.empty:
@@ -770,13 +848,15 @@ def render_chat_tab(name: str, data: dict):
         def _chat_progress(current, total, status_text):
             progress_bar.progress(current / max(total, 1), text=status_text)
 
+        rep_page_map = load_report_page_map(data)
+        rep_full_text = load_report_text(data)
         result = answer_chat_question(
             question=question,
             company_name=name,
             kpis=data["kpis"],
             topic_index=data["topic_index"],
-            page_map=data["page_map"],
-            full_text=data["full_text"],
+            page_map=rep_page_map,
+            full_text=rep_full_text,
             chat_history=data["chat_history"],
             progress_callback=_chat_progress,
         )
@@ -1440,19 +1520,52 @@ def render_compare_tab():
     st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
     st.bar_chart(pd.DataFrame(chart_rows).set_index("Company")[list(CATEGORIES)])
 
-    st.subheader(f"All {len(KPI_CATALOG)} KPIs side by side")
-    year_label = st.radio("Year", ["Current year", "Previous year"], horizontal=True, key="compare_year")
-    year = "current" if year_label == "Current year" else "previous"
-    matrix_df = pd.DataFrame(_kpi_matrix_rows(reports, year))
-    st.dataframe(matrix_df, width="stretch", hide_index=True)
-    st.caption("`*` = derived (unit-converted or computed from stated figures). `—` = not disclosed.")
-    st.download_button(
-        "Download comparison CSV",
-        matrix_df.to_csv(index=False),
-        file_name=f"esg_kpi_comparison_{year}.csv",
-        mime="text/csv",
-        key="dl_shared_csv",
-    )
+    st.subheader("📊 Comparative Analysis Across Companies")
+    found_years = set(["FY2024", "FY2025", "FY2026"])
+    for report in reports:
+        dom_c, dom_p = extract_report_dominant_years(report)
+        if dom_c:
+            found_years.add(dom_c)
+        if dom_p:
+            found_years.add(dom_p)
+        for r in report.get("kpis") or []:
+            for slot in (r.get("current"), r.get("previous")):
+                if slot and slot.get("fy"):
+                    s = standardize_fy(slot.get("fy"))
+                    if s:
+                        found_years.add(s)
+            for y_k in (r.get("years") or {}).keys():
+                s = standardize_fy(y_k)
+                if s:
+                    found_years.add(s)
+    available_years = sorted(found_years)
+    default_idx = available_years.index("FY2026") if "FY2026" in available_years else len(available_years) - 1
+
+    col_fy, col_dl1, col_dl2 = st.columns([2, 2, 2])
+    with col_fy:
+        selected_fy = st.selectbox("Select Financial Year for Comparison", available_years, index=default_idx, key="compare_fy_select")
+
+    comp_df = comparative_analysis_frame(reports, target_fy=selected_fy)
+    with col_dl1:
+        st.download_button(
+            f"📥 Download CSV ({selected_fy})",
+            comp_df.to_csv(index=False),
+            file_name=f"comparative_analysis_{selected_fy}.csv",
+            mime="text/csv",
+            key="dl_comp_csv_btn",
+        )
+    with col_dl2:
+        excel_bytes = export_excel_workbook(reports, target_fy=selected_fy)
+        st.download_button(
+            "📥 Download Excel Workbook (.xlsx)",
+            excel_bytes,
+            file_name=f"ESG_Comparative_Analysis_{selected_fy}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_comp_excel_btn",
+        )
+
+    st.dataframe(comp_df, width="stretch", hide_index=True)
+    st.caption(f"Showing KPIs across all companies for {selected_fy}. Columns: S. No. | KPI Name | Unit | [Companies]. '—' indicates not disclosed for that financial year.")
 
     st.subheader("Look up one KPI")
     options = [f"{k['id']} — {k['name']}" for k in KPI_CATALOG]

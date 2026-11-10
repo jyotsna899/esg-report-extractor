@@ -34,6 +34,54 @@ def _atomic_write_json(path, payload):
     os.replace(temporary, path)
 
 
+def text_dir():
+    folder = os.path.join(data_dir(), "text")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _text_filename(company_name: str, source_file: str = "") -> str:
+    slug = re.sub(r"[^\w\-]+", "_", f"{company_name}_{source_file}").strip("_")
+    return f"{slug or 'report'}.txt"
+
+
+def save_report_text(company_name: str, text: str, source_file: str = "") -> str:
+    if not text:
+        return ""
+    fname = _text_filename(company_name, source_file)
+    fpath = os.path.join(text_dir(), fname)
+    with open(fpath, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return fname
+
+
+def load_report_text(report: dict) -> str:
+    if not report:
+        return ""
+    if report.get("full_text"):
+        return report["full_text"]
+    text_file = report.get("text_file") or _text_filename(report.get("name", ""), report.get("source_file", ""))
+    fpath = os.path.join(text_dir(), text_file)
+    if os.path.isfile(fpath):
+        try:
+            with open(fpath, encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            pass
+    return ""
+
+
+def load_report_page_map(report: dict) -> dict[int, str]:
+    if not report:
+        return {}
+    if report.get("page_map"):
+        return {int(k): v for k, v in report["page_map"].items()}
+    text = load_report_text(report)
+    if text:
+        return _rebuild_page_map(text)
+    return {}
+
+
 def _rebuild_page_map(text):
     pages = {}
     if not text:
@@ -54,19 +102,14 @@ def load_reports(path=None):
         payload = json.load(handle)
     reports = payload.get("reports", []) if isinstance(payload, dict) else payload
     for report in reports:
-        raw_map = report.get("page_map") or {}
-        full_text = report.get("full_text") or ""
-        if raw_map:
-            report["page_map"] = {int(key): value for key, value in raw_map.items()}
-        elif full_text:
-            report["page_map"] = _rebuild_page_map(full_text)
-        else:
-            report["page_map"] = {}
         report.setdefault("chat_history", [])
         report.setdefault("kpis", [])
         report.setdefault("topic_index", [])
         report.setdefault("full_text", "")
         report.setdefault("summary", "")
+        # Normalize page_map keys to int if present, else empty dict
+        raw_map = report.get("page_map") or {}
+        report["page_map"] = {int(k): v for k, v in raw_map.items()} if raw_map else {}
     return reports
 
 
@@ -75,12 +118,37 @@ def save_reports(reports, path=None):
     payload = []
     for report in reports:
         item = dict(report)
-        if item.get("full_text"):
-            item.pop("page_map", None)
-        else:
-            item["page_map"] = {str(key): value for key, value in (item.get("page_map") or {}).items()}
+        full_text = item.pop("full_text", None)
+        item.pop("page_map", None)
+        if full_text:
+            fname = save_report_text(item.get("name", ""), full_text, item.get("source_file", ""))
+            if fname:
+                item["text_file"] = fname
         payload.append(item)
     _atomic_write_json(path, {"reports": payload})
+
+
+def _merge_reports_data(existing: dict, incoming: dict) -> dict:
+    merged = dict(incoming)
+    merged["chat_history"] = (existing.get("chat_history") or []) + (incoming.get("chat_history") or [])
+    ex_kpis = {r["kpi_id"]: r for r in (existing.get("kpis") or [])}
+    in_kpis = {r["kpi_id"]: r for r in (incoming.get("kpis") or [])}
+    all_kpis = []
+    for kid, in_r in in_kpis.items():
+        ex_r = ex_kpis.get(kid)
+        if not ex_r:
+            all_kpis.append(in_r)
+            continue
+        merged_r = dict(in_r)
+        ex_years = dict(ex_r.get("years") or {})
+        in_years = dict(in_r.get("years") or {})
+        for y, slot in ex_years.items():
+            if y not in in_years and slot.get("value") is not None:
+                in_years[y] = slot
+        merged_r["years"] = in_years
+        all_kpis.append(merged_r)
+    merged["kpis"] = all_kpis
+    return merged
 
 
 def upsert_report(new_report, path=None):
@@ -92,7 +160,7 @@ def upsert_report(new_report, path=None):
         same_source = bool(new_source and existing.get("source_file") == new_source)
         same_name = bool(new_name and existing.get("name") == new_name)
         if same_source or same_name:
-            reports[idx] = new_report
+            reports[idx] = _merge_reports_data(existing, new_report) if same_name and not same_source else new_report
             replaced = True
             break
     if not replaced:
@@ -186,3 +254,15 @@ def clear_pending_job():
     input_dir = job_input_dir()
     if os.path.isdir(input_dir):
         shutil.rmtree(input_dir, ignore_errors=True)
+
+
+def clear_all_reports(path=None):
+    path = path or store_path()
+    if os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    tdir = text_dir()
+    if os.path.isdir(tdir):
+        shutil.rmtree(tdir, ignore_errors=True)

@@ -171,3 +171,48 @@ def test_text_kpi_and_unknown_ids_ignored():
     assert by_id["E10"]["status"] == "reported"
     assert len(records) == len(KPI_CATALOG)
     assert report_ready({"kpis": records})
+
+
+def test_standardize_fy():
+    from kpis import standardize_fy
+    assert standardize_fy("FY 2024-25") == "FY2025"
+    assert standardize_fy("2024-25") == "FY2025"
+    assert standardize_fy("FY25") == "FY2025"
+    assert standardize_fy("FY 2023-24") == "FY2024"
+    assert standardize_fy("FY24") == "FY2024"
+    assert standardize_fy("FY 2025-26") == "FY2026"
+    assert standardize_fy("FY26") == "FY2026"
+    assert standardize_fy("2026") == "FY2026"
+    assert standardize_fy(None) == ""
+
+
+def test_company_multi_year_frame_and_comparative():
+    from kpis import company_multi_year_frame, comparative_analysis_frame, export_excel_workbook
+    _, records = run([
+        {"kpi_id": "E1", "current": {"fy": "FY 2024-25", "value": 31.0, "unit": "%"},
+                        "previous": {"fy": "FY 2023-24", "value": 24.5, "unit": "%"}},
+        {"kpi_id": "E2", "current": {"fy": "FY 2024-25", "value": 120.0, "unit": "MJ per Rs. crore"},
+                        "previous": {"fy": "FY 2023-24", "value": 130.0, "unit": "MJ per Rs. crore"}},
+    ])
+    report = {"name": "Acme Corp", "kpis": records}
+    df_multi = company_multi_year_frame(report)
+    assert "S. No." in df_multi.columns
+    assert "Unit" in df_multi.columns
+    assert "Env./Social/Gov." in df_multi.columns
+    assert "KPI" in df_multi.columns
+    assert "FY2024" in df_multi.columns
+    assert "FY2025" in df_multi.columns
+    assert "FY2026" in df_multi.columns
+
+    # Comparative analysis frame
+    comp_df = comparative_analysis_frame([report], target_fy="FY2025")
+    assert "S. No." in comp_df.columns
+    assert "KPI Name" in comp_df.columns
+    assert "Unit" in comp_df.columns
+    assert "Acme Corp" in comp_df.columns
+    e1_row = comp_df[comp_df["S. No."] == "E1"].iloc[0]
+    assert "31" in str(e1_row["Acme Corp"])
+
+    # Excel export
+    excel_bytes = export_excel_workbook([report], target_fy="FY2025")
+    assert len(excel_bytes) > 1000

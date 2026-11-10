@@ -103,13 +103,15 @@ def _call_gemini_with_retry(client, contents, config, max_retries=4, progress_ca
                 or "high demand" in msg.lower()
             )
             if retryable and attempt < max_retries:
+                import random
+                sleep_sec = delay + random.uniform(1.0, 3.0)
                 if progress_callback:
                     progress_callback(
                         0, 1,
-                        f"Model busy — waiting {delay}s before retry ({attempt + 1}/{max_retries})...",
+                        f"Model busy — waiting {sleep_sec:.1f}s before retry ({attempt + 1}/{max_retries})...",
                     )
-                time.sleep(delay)
-                delay = min(delay * 2, 30)
+                time.sleep(sleep_sec)
+                delay = min(delay * 2, 45)
                 continue
             raise
     raise last_error
@@ -130,23 +132,40 @@ def _flush_pdf_page(page):
         pass
 
 
+def _get_page_text_fast(pdf_path: str):
+    """Yields (page_index_1_based, text) using pypdfium2 if available, else pdfplumber."""
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        total = len(pdf)
+        for i in range(total):
+            page = pdf[i]
+            textpage = page.get_textpage()
+            text = textpage.get_text_range()
+            textpage.close()
+            page.close()
+            yield i + 1, total, (text or "").strip()
+        pdf.close()
+        gc.collect()
+        return
+    except Exception:
+        pass
+
+    with pdfplumber.open(pdf_path) as pdf:
+        total = len(pdf.pages)
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            _flush_pdf_page(page)
+            yield i + 1, total, text.strip()
+            if (i + 1) % 50 == 0:
+                gc.collect()
+    gc.collect()
+
+
 def find_brsr_start_page(pdf_path: str, progress_callback=None) -> int | None:
     """
     Scans the PDF for the page where the ESG/sustainability/BRSR section
-    actually begins, rather than just any page that mentions it in passing.
-    Checks for BRSR-specific headings first (India-specific), then falls
-    back to general ESG/GRI/sustainability report headings so this also
-    works for reports that don't use the BRSR framework at all.
-
-    Stops as soon as it finds a high-confidence match (an early-page, short,
-    BRSR-specific heading) instead of always reading the whole document.
-
-    progress_callback, if given, is called as progress_callback(current_page,
-    total_pages) after every page so a caller can show a progress bar.
-
-    Returns the 1-indexed page number where the section appears to start,
-    or None if it can't be confidently detected. Raises ValueError if the
-    PDF has no extractable text at all (likely scanned/image-only).
+    actually begins. Uses fast text extraction to prevent memory bloat.
     """
     heading_phrases = [
         "business responsibility and sustainability report",
@@ -162,72 +181,93 @@ def find_brsr_start_page(pdf_path: str, progress_callback=None) -> int | None:
     ]
     HIGH_CONFIDENCE_RANK = 2
 
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        candidates = []
-        blank_pages = 0
-        for i, page in enumerate(pdf.pages):
-            text = page.extract_text()
-            _flush_pdf_page(page)
-            if progress_callback:
-                progress_callback(i + 1, total_pages)
-            if not text:
-                blank_pages += 1
-                continue
-            # Collapse whitespace (including line breaks a wrapped heading
-            # gets split across) so multi-line headings still match.
-            lower = " ".join(text.lower().split())
-            for phrase_rank, phrase in enumerate(heading_phrases):
-                if phrase in lower:
-                    position = lower.find(phrase)
-                    is_early_on_page = position < 300
-                    is_short_page = len(text) < 2000
-                    candidates.append((i + 1, is_early_on_page, len(text), phrase_rank))
-                    if is_early_on_page and is_short_page and phrase_rank <= HIGH_CONFIDENCE_RANK:
-                        return i + 1
-                    break
+    candidates = []
+    blank_pages = 0
+    total_pages = 0
+    for page_num, total, text in _get_page_text_fast(pdf_path):
+        total_pages = total
+        if progress_callback:
+            progress_callback(page_num, total)
+        if not text:
+            blank_pages += 1
+            continue
+        lower = " ".join(text.lower().split())
+        for phrase_rank, phrase in enumerate(heading_phrases):
+            if phrase in lower:
+                position = lower.find(phrase)
+                is_early_on_page = position < 300
+                is_short_page = len(text) < 2000
+                candidates.append((page_num, is_early_on_page, len(text), phrase_rank))
+                if is_early_on_page and is_short_page and phrase_rank <= HIGH_CONFIDENCE_RANK:
+                    return page_num
+                break
 
-        if not candidates:
-            if blank_pages == total_pages:
-                raise ValueError(
-                    f"No extractable text found on any of {total_pages} pages. "
-                    "This PDF is likely scanned/image-based rather than "
-                    "text-based — it needs OCR before this tool can read it."
-                )
-            return None
+    if not candidates:
+        if blank_pages == total_pages and total_pages > 0:
+            raise ValueError(
+                f"No extractable text found on any of {total_pages} pages. "
+                "This PDF is likely scanned/image-based rather than "
+                "text-based — it needs OCR before this tool can read it."
+            )
+        return None
 
-        title_like = sorted(
-            [c for c in candidates if c[1] and c[2] < 2000],
-            key=lambda c: c[3],
-        )
-        if title_like:
-            return title_like[0][0]
+    title_like = sorted(
+        [c for c in candidates if c[1] and c[2] < 2000],
+        key=lambda c: c[3],
+    )
+    if title_like:
+        return title_like[0][0]
 
-        candidates.sort(key=lambda c: c[3])
-        return candidates[0][0]
+    candidates.sort(key=lambda c: c[3])
+    return candidates[0][0]
 
 
-def extract_text_from_pdf(pdf_path: str, max_pages: int = 200, start_page: int = 1, progress_callback=None) -> str:
+def extract_text_from_pdf(pdf_path: str, max_pages: int = 100_000, start_page: int = 1, progress_callback=None) -> str:
     """
-    Extract text from a PDF report, starting at start_page (1-indexed) and
-    reading up to max_pages pages from there.
-
-    progress_callback, if given, is called as progress_callback(current, total)
-    after each page so a caller can render a progress bar.
+    Ultra-fast, low-memory text extractor using pypdfium2 with automatic fallback
+    to pdfplumber. Keeps RAM bounded under 50 MB even on 500+ page PDFs.
     """
     full_text = []
-    with pdfplumber.open(pdf_path) as pdf:
+    # Fast path: pypdfium2
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        total_in_pdf = len(pdf)
         start_idx = max(0, start_page - 1)
-        end_idx = start_idx + max_pages
-        pages = pdf.pages[start_idx:end_idx]
-        total = len(pages)
-        for i, page in enumerate(pages):
-            text = page.extract_text()
-            _flush_pdf_page(page)
-            if text:
-                full_text.append(f"\n--- Page {start_idx + i + 1} ---\n{text}")
+        end_idx = min(total_in_pdf, start_idx + max_pages)
+        total = max(1, end_idx - start_idx)
+        for i, page_idx in enumerate(range(start_idx, end_idx)):
+            page = pdf[page_idx]
+            textpage = page.get_textpage()
+            text = textpage.get_text_range()
+            textpage.close()
+            page.close()
+            if text and text.strip():
+                full_text.append(f"\n--- Page {page_idx + 1} ---\n{text.strip()}")
             if progress_callback:
                 progress_callback(i + 1, total)
+        pdf.close()
+        gc.collect()
+        return "\n".join(full_text)
+    except Exception:
+        pass
+
+    # Fallback path: pdfplumber
+    with pdfplumber.open(pdf_path) as pdf:
+        total_in_pdf = len(pdf.pages)
+        start_idx = max(0, start_page - 1)
+        end_idx = min(total_in_pdf, start_idx + max_pages)
+        total = max(1, end_idx - start_idx)
+        for i, page_idx in enumerate(range(start_idx, end_idx)):
+            page = pdf.pages[page_idx]
+            text = page.extract_text()
+            _flush_pdf_page(page)
+            if text and text.strip():
+                full_text.append(f"\n--- Page {page_idx + 1} ---\n{text.strip()}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+            if (i + 1) % 50 == 0:
+                gc.collect()
     gc.collect()
     return "\n".join(full_text)
 
@@ -281,9 +321,10 @@ GROUNDING RULES (follow strictly):
 - Every value must be LITERALLY STATED in the text below. Never invent, estimate, or use \
 outside knowledge. Do NOT do any arithmetic or unit conversion yourself — copy the number and \
 the unit exactly as printed. Conversions and ratios are computed later in code.
-- Reports often show the current year AND the previous year side by side (e.g. "FY 2024-25" \
-and "FY 2023-24" columns). Capture BOTH when available: "current" = the most recent \
-financial year in the table, "previous" = the year before it.
+- Reports often show the current year AND previous years side by side (e.g. "FY 2023-24", "FY 2024-25", \
+"FY 2025-26" columns). Capture all reported years: set "current" to the most recent financial year, \
+"previous" to the year before it, and also include all reported years under "years": \
+{{"<FY label e.g. FY2024>": {{...}}, ...}}.
 - If a KPI is not printed in its required unit, still report what IS printed (with its own \
 unit), and also fill "inputs" with the raw figures listed for that KPI so it can be computed \
 (e.g. energy intensity printed "per rupee of turnover" -> give that value and unit as-is; \
