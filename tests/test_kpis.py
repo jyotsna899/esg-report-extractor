@@ -142,15 +142,15 @@ def test_ltifr_per_200k_hours_scaled():
     assert by_id["S3"]["current"]["value"] == pytest.approx(1.0)
 
 
-def test_merge_prefers_stated_value_over_inputs():
+def test_merge_derives_from_raw_inputs_over_stated_value():
     chunk1 = [{"kpi_id": "E7", "current": {"inputs": {"water_recycled": {"value": 10, "unit": "kL"},
                                                       "water_consumption": {"value": 100, "unit": "kL"}}}}]
     chunk2 = [{"kpi_id": "E7", "current": {"fy": "FY25", "value": 12, "unit": "%"}, "pages": [44]}]
     by_id, _ = run(chunk1, chunk2)
     e7 = by_id["E7"]
-    assert e7["status"] == "reported"
-    assert e7["current"]["value"] == 12
-    assert e7["pages"] == [44]
+    assert e7["status"] == "derived"
+    assert e7["current"]["value"] == 10.0
+    assert 44 in e7["pages"]
 
 
 def test_merge_fills_components_across_chunks():
@@ -448,3 +448,94 @@ def test_s3_and_s4_derivations():
     assert by_id["S3"]["current"]["unit"] == "per million hours worked"
     assert by_id["S4"]["current"]["value"] == pytest.approx(5.0)
     assert by_id["S4"]["current"]["unit"] == "%"
+
+
+def test_e2_overrides_verbatim_57500_with_derived_formula():
+    """HUL case: Company reported verbatim 57,500, but raw total energy is 3,651,000 GJ and revenue is 60,000 cr."""
+    f1 = {
+        "kpi_id": "F1",
+        "current": {
+            "fy": "FY 2025-26",
+            "unit": "Rs. crore",
+            "components": {"revenue": 60000, "boundary": "consolidated"},
+        },
+    }
+    e1 = {
+        "kpi_id": "E1",
+        "current": {
+            "fy": "FY 2025-26",
+            "inputs": {
+                "renewable_energy": {"value": 3560000, "unit": "GJ"},
+                "total_energy": {"value": 3651000, "unit": "GJ"},
+            },
+        },
+    }
+    e2_verbatim = {
+        "kpi_id": "E2",
+        "current": {
+            "fy": "FY 2025-26",
+            "value": 57500,
+            "unit": "MJ per Rs. crore",
+        },
+    }
+    by_id, _ = run([f1, e1, e2_verbatim])
+    e2 = by_id["E2"]
+    # Formula: 3,651,000 GJ * 1000 / 60,000 cr = 60,850 MJ / Rs. crore
+    assert e2["current"]["value"] == pytest.approx(60850.0)
+    assert e2["status"] == "derived"
+    assert "replaces reported 57,500" in e2["derivation"]
+
+
+def test_cross_kpi_pooling_water_and_waste():
+    """Tests that E6 uses E7's water consumption, and E8 uses E9's total waste."""
+    f1 = {
+        "kpi_id": "F1",
+        "current": {"fy": "FY25", "unit": "Rs. crore", "components": {"revenue": 10000}},
+    }
+    e6 = {"kpi_id": "E6", "current": {"value": 45.8, "unit": "kL per Rs. crore"}}
+    e7 = {
+        "kpi_id": "E7",
+        "current": {
+            "inputs": {
+                "water_recycled": {"value": 50000, "unit": "kL"},
+                "water_consumption": {"value": 200000, "unit": "kL"},
+            }
+        },
+    }
+    e8 = {"kpi_id": "E8", "current": {"value": 1.8, "unit": "t per Rs. crore"}}
+    e9 = {
+        "kpi_id": "E9",
+        "current": {
+            "inputs": {
+                "waste_recovered": {"value": 15000, "unit": "MT"},
+                "total_waste": {"value": 30000, "unit": "MT"},
+            }
+        },
+    }
+    by_id, _ = run([f1, e6, e7, e8, e9])
+    # E6: 200,000 kL / 10,000 cr = 20.0 kL / Rs. crore (replaces 45.8)
+    assert by_id["E6"]["current"]["value"] == pytest.approx(20.0)
+    assert by_id["E6"]["status"] == "derived"
+    # E7: 50,000 / 200,000 * 100 = 25.0%
+    assert by_id["E7"]["current"]["value"] == pytest.approx(25.0)
+    assert by_id["E7"]["status"] == "derived"
+    # E8: 30,000 MT / 10,000 cr = 3.0 MT / Rs. crore (replaces 1.8)
+    assert by_id["E8"]["current"]["value"] == pytest.approx(3.0)
+    assert by_id["E8"]["status"] == "derived"
+    # E9: 15,000 / 30,000 * 100 = 50.0%
+    assert by_id["E9"]["current"]["value"] == pytest.approx(50.0)
+    assert by_id["E9"]["status"] == "derived"
+
+
+def test_cross_kpi_pooling_csr_allocation():
+    """Tests that S13 derives efficiency from S12's budgeted and spent components."""
+    s12 = {
+        "kpi_id": "S12",
+        "current": {"components": {"budgeted": 20.0, "spent": 25.0}, "unit": "Rs. crore"},
+    }
+    s13 = {"kpi_id": "S13", "current": {"value": 90.0, "unit": "%"}}  # inaccurate reported
+    by_id, _ = run([s12, s13])
+    # S13: (25.0 / 20.0) * 100 = 125.0%
+    assert by_id["S13"]["current"]["value"] == pytest.approx(125.0)
+    assert by_id["S13"]["status"] == "derived"
+

@@ -317,21 +317,29 @@ def chunk_text(text: str, chunk_size_chars: int = SINGLE_CALL_CHAR_LIMIT) -> lis
 EXTRACTION_PROMPT = """You are an ESG data analyst. Read the report text below, which includes \
 "--- Page N ---" markers. Extract ONLY the {kpi_count} KPIs listed below — nothing else.
 
-GROUNDING RULES (follow strictly):
-- Every value must be LITERALLY STATED in the text below. Never invent, estimate, or use \
-outside knowledge. Do NOT do any arithmetic or unit conversion yourself — copy the number and \
-the unit exactly as printed. Conversions and ratios are computed later in code.
+GROUNDING & FORMULA DERIVATION RULES (follow strictly):
+- MANDATORY RAW DISCLOSURES: Whenever a section or table contains raw base numerical figures \
+(e.g. raw energy consumption in GJ/MWh, renewable vs non-renewable, Scope 1 and Scope 2 emissions, \
+SOx and NOx masses, water consumption and recycling volumes, waste generated and recovered, \
+employees and workers headcount, fatalities, injuries, person-hours worked, CSR spend and budget, \
+revenues from operations), you MUST extract them into "inputs" or "components" with their exact printed units.
+- CALCULATE FORMULA-DERIVED METRICS: For all KPIs with a FORMULA (e.g. E1, E2, E3, E5, E6, E7, E8, E9, \
+S1, S2, S3, S4, S6, S7, S8, S9, S13, G1, G2, G3, F2):
+  * If the raw base numbers are disclosed in the text, calculate the metric according to the FORMULA provided in the KPI list \
+and return the calculated value in "value".
+  * NEVER blindly copy a pre-printed company intensity or ratio (such as Energy Intensity = 57,500 or \
+Renewable % = 100%) if it is based on internal company denominators or contradicts the raw numbers. \
+Always calculate the standard metric from raw numbers.
+  * In "unit", write the exact target standard unit if calculated, or the literal printed unit if reporting verbatim.
+- If revenue is not in the current text chunk, still extract the raw physical consumption into "inputs" so that \
+the exact intensity is deterministically computed against revenue in post-processing.
 - Reports often show the current year AND previous years side by side (e.g. "FY 2023-24", "FY 2024-25", \
 "FY 2025-26" columns). Capture all reported years: set "current" to the most recent financial year, \
 "previous" to the year before it, and also include all reported years under "years": \
 {{"<FY label e.g. FY2024>": {{...}}, ...}}.
-- If a KPI is not printed in its required unit, still report what IS printed (with its own \
-unit), and also fill "inputs" with the raw figures listed for that KPI so it can be computed \
-(e.g. energy intensity printed "per rupee of turnover" -> give that value and unit as-is; \
-water recycling rate not printed -> give water_recycled and water_consumption in "inputs").
 - Only include a KPI if this text actually discloses something for it. Skip it otherwise.
 
-KPI LIST (ID | Name | Required unit/format | components / inputs):
+KPI LIST (ID | Name | Required unit/format | components / inputs / formula):
 {kpi_block}
 
 Return ONLY a valid JSON object with keys: "kpis", "topics", and optionally "reporting_boundary". \
@@ -353,9 +361,34 @@ revenue/ebitda/pat, S12 budgeted/spent, G3 count/pct, E10 status/target_year/sco
    - For F1: extract revenue from operations, EBITDA, and PAT. If both standalone and consolidated \
 are reported, put standalone in components.revenue_standalone, consolidated in components.revenue_consolidated, \
 and reporting boundary ('standalone' or 'consolidated') in components.boundary. Put the printed money unit in "unit".
-   - For E1: ALWAYS extract both renewable_energy and total_energy (and non_renewable_energy if shown) \
-into "inputs" with their units (e.g. GJ or MWh), even if a pre-calculated % is printed.
-   - For E2: ALWAYS extract raw total_energy consumption (e.g. in GJ) into "inputs" with its unit.
+   - For E1 (Renewable Energy Share): ALWAYS extract renewable_energy and total_energy (and non_renewable_energy if shown) \
+into "inputs" with their units (e.g. GJ or MWh). If raw numbers are present, calculate value = (renewable_energy / total_energy) * 100.
+   - For E2 (Energy Intensity): ALWAYS extract raw total_energy consumption (e.g. in GJ) into "inputs" with its unit. \
+Do NOT copy an arbitrary pre-calculated intensity (e.g. 57,500) if raw energy is disclosed. If both raw total_energy (in GJ) \
+and turnover/revenue (in Rs. crore) are available in this text, calculate: value = (total_energy in GJ * 1000) / revenue in Rs. crore.
+   - For E3 (Emission Intensity): ALWAYS extract scope1 and scope2 into "inputs". If revenue is in this text, \
+calculate value = (scope1 + scope2) / revenue.
+   - For E5 (Air Emission Intensity): ALWAYS extract sox and nox into "inputs" (convert MT to kg if needed).
+   - For E6 (Water Intensity): ALWAYS extract total water_consumption (in kL) into "inputs".
+   - For E7 (Water Recycling %): ALWAYS extract water_recycled and water_consumption into "inputs", and calculate (water_recycled / water_consumption) * 100.
+   - For E8 (Waste Intensity): ALWAYS extract total_waste (in tonnes) into "inputs".
+   - For E9 (Waste Recycling %): ALWAYS extract waste_recovered and total_waste into "inputs", and calculate (waste_recovered / total_waste) * 100.
+   - For S1 (Headcount): ALWAYS extract components: employees and workers, and calculate value = employees + workers.
+   - For S2 (Fatalities): ALWAYS extract components: employees and workers, and calculate value = employees + workers (preserve 0).
+   - For S3 (LTIFR): ALWAYS extract injuries and hours_worked into "inputs", and calculate (injuries * 1,000,000) / hours_worked.
+   - For S4 (Well-being %): ALWAYS extract wellbeing_spend and payroll into "inputs", and calculate (spend / payroll) * 100.
+   - For S6 (Gender Diversity %): ALWAYS extract components: female_pct, male_pct, or inputs: female_count, male_count.
+   - For S7 (Income Inequality): Extract highest_paid and median_remuneration, and calculate highest / median.
+   - For S8 (Wage Ratio): Extract median_female_pay and median_male_pay, and calculate female / male.
+   - For S9 (Training %): Extract employees_trained and total_employees, and calculate (trained / total) * 100.
+   - For S10 (POSH): Extract components: filed, resolved, pending.
+   - For S11 (Complaints): Extract components: received, resolved, pending.
+   - For S12 (CSR): Extract components: budgeted, spent.
+   - For S13 (CSR Allocation Efficiency %): Extract spent and budgeted, and calculate (spent / budgeted) * 100.
+   - For G1 (Women Directors %): Extract women_directors and board_size, and calculate (women / board_size) * 100.
+   - For G2 (Women KMP %): Extract women_kmp and total_kmp, and calculate (women / total_kmp) * 100.
+   - For G3 (Independent Directors): Extract components: count, pct, board_size.
+   - For F2 (Green Capex %): Extract green_capex and total_capex, and calculate (green_capex / total_capex) * 100.
    - For Yes/No KPIs (E10, G5, G7, G8, G9, G10) put "Yes"/"No" (or the assurance level for \
 G8) in components.status and names/frameworks/years/providers in components.detail or the \
 listed components.

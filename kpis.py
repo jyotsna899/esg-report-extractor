@@ -98,7 +98,8 @@ KPI_CATALOG = [
      "required_unit": "budgeted amount and amount spent (Rs. crore)", "unit_kind": "money", "direction": None,
      "components": ["budgeted", "spent"]},
     {"id": "S13", "name": "CSR Allocation Efficiency", "category": "Social",
-     "required_unit": "% (spent / budgeted)", "unit_kind": "pct", "direction": "higher"},
+     "required_unit": "% (spent / budgeted)", "unit_kind": "pct", "direction": "higher",
+     "inputs": ["spent", "budgeted"]},
     {"id": "S14", "name": "Rural & Semi-Urban Job Creation", "category": "Social",
      "required_unit": "headcount or % of total", "unit_kind": "text", "direction": "higher"},
     {"id": "S15", "name": "Investment in Aspirational Districts", "category": "Social",
@@ -180,6 +181,34 @@ INPUT_HINTS = {
     "board_size": "total number of directors on the board",
     "women_kmp": "number of women KMPs",
     "total_kmp": "total number of KMPs",
+    "spent": "actual amount spent on CSR (Rs. crore or Lakh)",
+    "budgeted": "budgeted or mandated CSR obligation amount (Rs. crore or Lakh)",
+}
+
+# Explicit formula definitions for all derived / calculable KPIs
+KPI_FORMULAS = {
+    "E1": "(renewable_energy / total_energy) * 100",
+    "E2": "(total_energy in GJ * 1000) / revenue in Rs. crore",
+    "E3": "(scope1 + scope2) / revenue in Rs. crore",
+    "E5": "(sox in kg + nox in kg) / revenue in Rs. crore",
+    "E6": "water_consumption in kL / revenue in Rs. crore",
+    "E7": "(water_recycled / water_consumption) * 100",
+    "E8": "total_waste in tonnes / revenue in Rs. crore",
+    "E9": "(waste_recovered / total_waste) * 100",
+    "S1": "employees + workers",
+    "S2": "employee_fatalities + worker_fatalities",
+    "S3": "(injuries * 1,000,000) / hours_worked",
+    "S4": "(wellbeing_spend / payroll) * 100",
+    "S6": "(female_count / total_headcount) * 100",
+    "S7": "highest_paid / median_remuneration",
+    "S8": "median_female_pay / median_male_pay",
+    "S9": "(employees_trained / total_employees) * 100",
+    "S13": "(spent / budgeted) * 100",
+    "G1": "(women_directors / board_size) * 100",
+    "G2": "(women_kmp / total_kmp) * 100",
+    "G3": "independent_directors_count",
+    "F1": "revenue from operations (standalone & consolidated)",
+    "F2": "(green_capex / total_capex) * 100",
 }
 
 
@@ -191,11 +220,14 @@ def build_kpi_prompt_block() -> str:
         for k in KPI_CATALOG:
             if k["category"] != category:
                 continue
-            line = f'{k["id"]} | {k["name"]} | {k["required_unit"]}'
+            kid = k["id"]
+            line = f'{kid} | {k["name"]} | {k["required_unit"]}'
+            if kid in KPI_FORMULAS:
+                line += f' | FORMULA: {KPI_FORMULAS[kid]}'
             if k.get("components"):
                 line += f' | components: {", ".join(k["components"])}'
             if k.get("inputs"):
-                line += " | inputs if not printed in required unit: " + "; ".join(
+                line += " | raw base inputs: " + "; ".join(
                     f"{i} = {INPUT_HINTS.get(i, i)}" for i in k["inputs"]
                 )
             lines.append(line)
@@ -401,22 +433,29 @@ def _clean_year(raw) -> dict:
 
 
 def _slot_score(kpi: dict, slot: dict) -> int:
-    """3 = value in the required unit, 2 = value in another unit / text / components, 1 = inputs only."""
-    has_value = slot["value"] is not None
+    """Higher score wins. Raw base inputs and components take precedence for calculable KPIs."""
+    has_inputs = bool(slot.get("inputs") and any(isinstance(v, dict) and v.get("value") is not None for v in slot["inputs"].values()))
+    has_comps = bool(slot.get("components") and any(v is not None and v != "" for v in slot["components"].values()))
+    has_value = slot.get("value") is not None
+    kind = kpi.get("unit_kind")
+
+    # If the KPI has formula inputs (e.g. E1, E2, E3, E5, E6, E7, E8, E9, S3, S4, S13),
+    # having raw inputs is top priority to allow formula calculation!
+    if kpi.get("inputs") and has_inputs:
+        return 4
     if has_value:
-        kind = kpi["unit_kind"]
-        if kind == "pct" and _is_pct_unit(slot["unit"]):
+        if kind == "pct" and _is_pct_unit(slot.get("unit")):
             return 3
         if kind in INTENSITY_KINDS:
             conv, _ = INTENSITY_KINDS[kind]
-            num, den = _split_ratio_unit(slot["unit"] or "")
+            num, den = _split_ratio_unit(slot.get("unit") or "")
             if conv(num) == 1.0 and _per_crore_factor(den) == 1.0:
                 return 3
             return 2
         return 3
-    if slot["components"] or slot["text"]:
+    if has_comps or slot.get("text"):
         return 2
-    if slot["inputs"]:
+    if has_inputs:
         return 1
     return 0
 
@@ -485,7 +524,7 @@ def merge_chunk_kpis(per_chunk: list[list[dict]]) -> dict:
             entry[y] = best
             if ctx and not entry["source_context"]:
                 entry["source_context"] = ctx
-            for p in pages:
+            for p in best["pages"]:
                 if p not in entry["pages"]:
                     entry["pages"].append(p)
         entry["pages"].sort()
@@ -596,15 +635,37 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
             if ren_val is not None and tot_val and _same_unit(ren_u, tot_u):
                 derived_pct = round((ren_val / tot_val) * 100.0, 2)
                 orig_val = slot["value"]
-                # If reported value is missing, differs by > 2%, or is 100% when ren < tot, use derived
-                if orig_val is None or (orig_val == 100.0 and derived_pct < 99.5) or abs(orig_val - derived_pct) > 2.0:
-                    slot["value"] = derived_pct
-                    slot["unit"] = "%"
-                    notes.append(f"renewable {_fmt(ren_val)} / total {_fmt(tot_val)} × 100 = {derived_pct:.2f}%")
-                    return done("derived")
-                else:
-                    slot["unit"] = "%"
-                    return done("reported")
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"renewable {_fmt(ren_val)} / total {_fmt(tot_val)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # E7: Water Recycling Rate %
+        if kid == "E7":
+            rec_val, rec_u = _input(slot, "water_recycled")
+            con_val, con_u = _input(slot, "water_consumption")
+            if rec_val is not None and con_val and _same_unit(rec_u, con_u):
+                derived_pct = round((rec_val / con_val) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"water recycled {_fmt(rec_val)} / consumption {_fmt(con_val)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # E9: Waste Recycling Rate %
+        if kid == "E9":
+            recov_val, recov_u = _input(slot, "waste_recovered")
+            tot_w, tot_wu = _input(slot, "total_waste")
+            if recov_val is not None and tot_w and _same_unit(recov_u, tot_wu):
+                derived_pct = round((recov_val / tot_w) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"waste recovered {_fmt(recov_val)} / total waste {_fmt(tot_w)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
 
         # S4: Employee Well-being Investment %
         if kid == "S4":
@@ -613,10 +674,90 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
             if spend is not None and pay:
                 sf = _money_to_crore(su or "") or 1.0
                 pf = _money_to_crore(pu or "") or 1.0
-                pct = round(((spend * sf) / (pay * pf)) * 100.0, 2)
-                slot["value"] = pct
+                derived_pct = round(((spend * sf) / (pay * pf)) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
                 slot["unit"] = "%"
-                notes.append(f"well-being spend {_fmt(spend)} / payroll {_fmt(pay)} × 100 = {pct:.2f}%")
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"well-being spend {_fmt(spend)} / payroll {_fmt(pay)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # S6: Gender Diversity Ratio
+        if kid == "S6":
+            fc, _ = _input(slot, "female_count")
+            mc, _ = _input(slot, "male_count")
+            if fc is not None and mc is not None and (fc + mc):
+                fp, mp = round(fc / (fc + mc) * 100, 2), round(mc / (fc + mc) * 100, 2)
+                slot["value"] = fp
+                slot["components"].update({"female_pct": fp, "male_pct": mp})
+                notes.append(f"female % = {_fmt(fc)} / ({_fmt(fc)} + {_fmt(mc)}) × 100 = {fp:.2f}%")
+                slot["unit"] = "%"
+                return done("derived")
+            fp = _num_component(slot, "female_pct")
+            mp = _num_component(slot, "male_pct")
+            if fp is not None and mp is None:
+                slot["components"]["male_pct"] = round(100 - fp, 2)
+            if mp is not None and fp is None:
+                slot["components"]["female_pct"] = round(100 - mp, 2)
+            if fp is not None:
+                slot["value"] = fp
+                slot["unit"] = "%"
+                return done("reported")
+
+        # S9: Training Coverage %
+        if kid == "S9":
+            tr, _ = _input(slot, "employees_trained")
+            tot, _ = _input(slot, "total_employees")
+            if tr is not None and tot and tot > 0:
+                derived_pct = round((tr / tot) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"trained {_fmt(tr)} / total employees {_fmt(tot)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # S13: CSR Allocation Efficiency %
+        if kid == "S13":
+            sp, _ = _input(slot, "spent")
+            if sp is None:
+                sp = _num_component(slot, "spent")
+            bg, _ = _input(slot, "budgeted")
+            if bg is None:
+                bg = _num_component(slot, "budgeted")
+            if sp is not None and bg and bg > 0:
+                derived_pct = round((sp / bg) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"csr spent {_fmt(sp)} / budgeted {_fmt(bg)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # G1: Board Gender Diversity %
+        if kid == "G1":
+            wd, _ = _input(slot, "women_directors")
+            bs, _ = _input(slot, "board_size")
+            if wd is not None and bs and bs > 0:
+                derived_pct = round((wd / bs) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"women directors {_fmt(wd)} / board size {_fmt(bs)} × 100 = {derived_pct:.2f}%{rep_note}")
+                return done("derived")
+
+        # G2: KMP Gender Diversity %
+        if kid == "G2":
+            wk, _ = _input(slot, "women_kmp")
+            tk, _ = _input(slot, "total_kmp")
+            if wk is not None and tk and tk > 0:
+                derived_pct = round((wk / tk) * 100.0, 2)
+                orig_val = slot["value"]
+                slot["value"] = derived_pct
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != derived_pct) else ""
+                notes.append(f"women KMP {_fmt(wk)} / total KMP {_fmt(tk)} × 100 = {derived_pct:.2f}%{rep_note}")
                 return done("derived")
 
         if slot["value"] is not None:
@@ -631,43 +772,6 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 return done("derived")
             return done("reported_unit_mismatch")
 
-        if kid == "S6":
-            fp = _num_component(slot, "female_pct")
-            mp = _num_component(slot, "male_pct")
-            if fp is None and mp is None:
-                fc, _ = _input(slot, "female_count")
-                mc, _ = _input(slot, "male_count")
-                if fc is not None and mc is not None and (fc + mc):
-                    fp, mp = fc / (fc + mc) * 100, mc / (fc + mc) * 100
-                    slot["components"].update({"female_pct": round(fp, 2), "male_pct": round(mp, 2)})
-                    notes.append(f"female % = {_fmt(fc)} / ({_fmt(fc)} + {_fmt(mc)}) × 100 = {fp:.2f}%")
-                    slot["unit"] = "%"
-                    return done("derived")
-                return done("not_disclosed")
-            if fp is not None and mp is None:
-                slot["components"]["male_pct"] = round(100 - fp, 2)
-            if mp is not None and fp is None:
-                slot["components"]["female_pct"] = round(100 - mp, 2)
-            slot["unit"] = "%"
-            return done("reported")
-
-        pairs = {
-            "E1": ("renewable_energy", "total_energy"),
-            "E7": ("water_recycled", "water_consumption"),
-            "E9": ("waste_recovered", "total_waste"),
-            "S9": ("employees_trained", "total_employees"),
-            "G1": ("women_directors", "board_size"),
-            "G2": ("women_kmp", "total_kmp"),
-        }
-        if kid in pairs:
-            a_name, b_name = pairs[kid]
-            a, au = _input(slot, a_name)
-            b, bu = _input(slot, b_name)
-            if a is not None and b and _same_unit(au, bu):
-                pct = a / b * 100
-                slot["value"], slot["unit"] = round(pct, 2), "%"
-                notes.append(f"{a_name} {_fmt(a)} / {b_name} {_fmt(b)} × 100 = {pct:.2f}%")
-                return done("derived")
         if slot["text"]:
             return done("reported")
         return done("not_disclosed")
@@ -690,24 +794,14 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
             total += v * f
             parts.append(f"{name} {_fmt(v)} {u or ''}".strip())
 
-        if total is not None and names and revenue_cr:
-            derived_int = round(total / revenue_cr, 4)
+        if total is not None and names and revenue_cr and revenue_cr > 0:
+            derived_int = round(total / revenue_cr, 2) if kind == "energy_int" else round(total / revenue_cr, 4)
             orig_val = slot["value"]
-            orig_u = _clean_unit(slot.get("unit"))
-            # If reported value is missing, not in standard target unit, or differs by > 5%, use derived
-            if orig_val is None or target.lower() not in orig_u:
-                slot["value"] = derived_int
-                slot["unit"] = target
-                notes.append(f"({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target}")
-                return done("derived")
-            elif abs(orig_val - derived_int) / max(derived_int, 1.0) > 0.05:
-                slot["value"] = derived_int
-                slot["unit"] = target
-                notes.append(f"derived: ({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target} (replaces reported {_fmt(orig_val)})")
-                return done("derived")
-            else:
-                slot["unit"] = target
-                return done("reported")
+            slot["value"] = derived_int
+            slot["unit"] = target
+            rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and abs(orig_val - derived_int) > 0.01) else ""
+            notes.append(f"derived: ({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target}{rep_note}")
+            return done("derived")
 
         if slot["value"] is not None:
             num, den = _split_ratio_unit(slot["unit"] or "")
@@ -768,28 +862,38 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
 
     # ---- ratios S7 / S8 ----
     if kind == "ratio":
-        if slot["value"] is not None:
-            return done("reported")
         a_name, b_name = kpi["inputs"]
         a, _ = _input(slot, a_name)
         b, _ = _input(slot, b_name)
-        if a is not None and b:
-            slot["value"] = round(a / b, 4)
-            notes.append(f"{a_name} {_fmt(a)} / {b_name} {_fmt(b)} = {slot['value']}")
+        if a is not None and b and b > 0:
+            ratio = round(a / b, 4)
+            orig_val = slot["value"]
+            slot["value"] = ratio
+            rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != ratio) else ""
+            notes.append(f"{a_name} {_fmt(a)} / {b_name} {_fmt(b)} = {ratio}{rep_note}")
             return done("derived")
+        if slot["value"] is not None:
+            return done("reported")
         return done("reported" if slot["text"] else "not_disclosed")
 
     # ---- counts ----
     if kind == "count":
         status = None
-        if kid == "S1" and slot["value"] is None:
+        if kid == "S1":
             e, _ = _input(slot, "employees")
+            if e is None:
+                e = _num_component(slot, "employees")
             w, _ = _input(slot, "workers")
+            if w is None:
+                w = _num_component(slot, "workers")
             if e is not None or w is not None:
-                slot["value"] = (e or 0) + (w or 0)
-                notes.append(f"employees {_fmt(e)} + workers {_fmt(w)} = {_fmt(slot['value'])}")
-                slot["components"].setdefault("employees", e)
-                slot["components"].setdefault("workers", w)
+                tot = (e or 0) + (w or 0)
+                orig_val = slot["value"]
+                slot["value"] = int(tot) if float(tot).is_integer() else tot
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != slot["value"]) else ""
+                notes.append(f"employees {_fmt(e)} + workers {_fmt(w)} = {_fmt(slot['value'])}{rep_note}")
+                slot["components"]["employees"] = e
+                slot["components"]["workers"] = w
                 status = "derived"
         if kid == "S2":
             emp = _num_component(slot, "employees")
@@ -799,10 +903,13 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 wrk, _ = _input(slot, "workers")
             if emp is not None or wrk is not None:
                 tot = (emp or 0) + (wrk or 0)
+                orig_val = slot["value"]
                 slot["value"] = int(tot) if float(tot).is_integer() else tot
                 slot["components"].setdefault("employees", emp if emp is not None else 0)
                 slot["components"].setdefault("workers", wrk if wrk is not None else 0)
-                status = "reported"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != slot["value"]) else ""
+                notes.append(f"fatalities: employees {_fmt(emp)} + workers {_fmt(wrk)} = {_fmt(slot['value'])}{rep_note}")
+                status = "derived"
         if kid == "G3" and slot["components"].get("pct") is None:
             c = _num_component(slot, "count")
             if c is None and slot["value"] is not None:
@@ -835,6 +942,178 @@ def _same_unit(a, b) -> bool:
 _STATUS_RANK = {"not_disclosed": 0, "reported_unit_mismatch": 1, "derived": 2, "reported": 3}
 
 
+def _build_metrics_pool(merged: dict, detected_boundary: str | None = None) -> dict[str, dict]:
+    """
+    Builds a unified repository of raw physical and financial figures disclosed
+    across all KPIs in the report. This enables cross-KPI formula derivations
+    (e.g., E2 using E1's total energy, E6 using E7's water consumption,
+    E8 using E9's waste, S13 using S12's CSR budget, etc.).
+    """
+    pool = {y: {} for y in YEARS}
+    extra_years = set()
+    for kid, entry in (merged or {}).items():
+        if isinstance(entry, dict) and isinstance(entry.get("years"), dict):
+            for y_k in entry["years"]:
+                std_yk = standardize_fy(y_k)
+                if std_yk and std_yk not in pool:
+                    pool[std_yk] = {}
+                    extra_years.add(std_yk)
+
+    all_pool_years = list(YEARS) + list(extra_years)
+
+    for y in all_pool_years:
+        p = pool[y]
+
+        # 1. Revenue & Boundary from F1
+        f1_entry = (merged or {}).get("F1") or {}
+        f1_slot = f1_entry.get(y) or (f1_entry.get("years") or {}).get(y) or {}
+        rev = _revenue_crore(f1_slot, boundary=detected_boundary)
+        if rev is not None and rev > 0:
+            p["revenue_crore"] = rev
+
+        def get_inp(kid, iname):
+            e = (merged or {}).get(kid) or {}
+            s = e.get(y) or (e.get("years") or {}).get(y) or {}
+            inp = (s.get("inputs") or {}).get(iname)
+            if isinstance(inp, dict) and inp.get("value") is not None:
+                n = to_number(inp["value"])
+                if n is not None:
+                    return n, inp.get("unit")
+            return None, None
+
+        def get_comp(kid, cname):
+            e = (merged or {}).get(kid) or {}
+            s = e.get(y) or (e.get("years") or {}).get(y) or {}
+            comps = s.get("components") or {}
+            val = comps.get(cname)
+            if val is not None:
+                n = to_number(val)
+                if n is not None:
+                    return n, s.get("unit")
+            return None, None
+
+        # 2. Energy
+        ren_v, ren_u = get_inp("E1", "renewable_energy")
+        non_v, non_u = get_inp("E1", "non_renewable_energy")
+        tot_v, tot_u = get_inp("E2", "total_energy")
+        if tot_v is None:
+            tot_v, tot_u = get_inp("E1", "total_energy")
+        if tot_v is None and ren_v is not None and non_v is not None:
+            tot_v = ren_v + non_v
+            tot_u = ren_u or non_u
+
+        if tot_v is not None:
+            p["total_energy"] = (tot_v, tot_u)
+        if ren_v is not None:
+            p["renewable_energy"] = (ren_v, ren_u)
+        if non_v is not None:
+            p["non_renewable_energy"] = (non_v, non_u)
+
+        # 3. Emissions
+        s1_v, s1_u = get_inp("E3", "scope1")
+        s2_v, s2_u = get_inp("E3", "scope2")
+        if s1_v is not None:
+            p["scope1"] = (s1_v, s1_u)
+        if s2_v is not None:
+            p["scope2"] = (s2_v, s2_u)
+
+        # 4. Air
+        sox_v, sox_u = get_inp("E5", "sox")
+        nox_v, nox_u = get_inp("E5", "nox")
+        if sox_v is not None:
+            p["sox"] = (sox_v, sox_u)
+        if nox_v is not None:
+            p["nox"] = (nox_v, nox_u)
+
+        # 5. Water
+        wc_v, wc_u = get_inp("E6", "water_consumption")
+        if wc_v is None:
+            wc_v, wc_u = get_inp("E7", "water_consumption")
+        wr_v, wr_u = get_inp("E7", "water_recycled")
+        if wc_v is not None:
+            p["water_consumption"] = (wc_v, wc_u)
+        if wr_v is not None:
+            p["water_recycled"] = (wr_v, wr_u)
+
+        # 6. Waste
+        tw_v, tw_u = get_inp("E8", "total_waste")
+        if tw_v is None:
+            tw_v, tw_u = get_inp("E9", "total_waste")
+        wrec_v, wrec_u = get_inp("E9", "waste_recovered")
+        if tw_v is not None:
+            p["total_waste"] = (tw_v, tw_u)
+        if wrec_v is not None:
+            p["waste_recovered"] = (wrec_v, wrec_u)
+
+        # 7. Workforce & Safety
+        emp_v, _ = get_comp("S1", "employees")
+        if emp_v is None:
+            emp_v, _ = get_inp("S1", "employees")
+        wkr_v, _ = get_comp("S1", "workers")
+        if wkr_v is None:
+            wkr_v, _ = get_inp("S1", "workers")
+        if emp_v is not None:
+            p["employees"] = emp_v
+        if wkr_v is not None:
+            p["workers"] = wkr_v
+        if emp_v is not None or wkr_v is not None:
+            p["total_headcount"] = (emp_v or 0) + (wkr_v or 0)
+
+        inj_v, _ = get_inp("S3", "injuries")
+        hrs_v, _ = get_inp("S3", "hours_worked")
+        if inj_v is not None:
+            p["injuries"] = inj_v
+        if hrs_v is not None:
+            p["hours_worked"] = hrs_v
+
+        # 8. Well-being & Payroll
+        wb_v, wb_u = get_inp("S4", "wellbeing_spend")
+        pay_v, pay_u = get_inp("S4", "payroll")
+        if wb_v is not None:
+            p["wellbeing_spend"] = (wb_v, wb_u)
+        if pay_v is not None:
+            p["payroll"] = (pay_v, pay_u)
+
+        # 9. CSR
+        csr_sp, csr_sp_u = get_comp("S12", "spent")
+        if csr_sp is None:
+            csr_sp, csr_sp_u = get_inp("S13", "spent")
+        csr_bg, csr_bg_u = get_comp("S12", "budgeted")
+        if csr_bg is None:
+            csr_bg, csr_bg_u = get_inp("S13", "budgeted")
+        if csr_sp is not None:
+            p["csr_spent"] = (csr_sp, csr_sp_u)
+        if csr_bg is not None:
+            p["csr_budgeted"] = (csr_bg, csr_bg_u)
+
+        # 10. Governance
+        wd_v, _ = get_inp("G1", "women_directors")
+        bs_v, _ = get_inp("G1", "board_size")
+        if bs_v is None:
+            bs_v, _ = get_inp("G3", "board_size")
+        if wd_v is not None:
+            p["women_directors"] = wd_v
+        if bs_v is not None:
+            p["board_size"] = bs_v
+
+        wk_v, _ = get_inp("G2", "women_kmp")
+        tk_v, _ = get_inp("G2", "total_kmp")
+        if wk_v is not None:
+            p["women_kmp"] = wk_v
+        if tk_v is not None:
+            p["total_kmp"] = tk_v
+
+        # 11. Capex
+        gc_v, _ = get_comp("F2", "green_capex")
+        tc_v, _ = get_comp("F2", "total_capex")
+        if gc_v is not None:
+            p["green_capex"] = gc_v
+        if tc_v is not None:
+            p["total_capex"] = tc_v
+
+    return pool
+
+
 def normalize_kpis(merged: dict, company_name: str = "Unknown", reporting_boundary: str | None = None) -> list[dict]:
     """Always returns exactly one record per catalog KPI, in catalog order."""
     merged = merged or {}
@@ -856,10 +1135,14 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown", reporting_bounda
                 break
     detected_boundary = detected_boundary or "standalone"
 
+    # Build cross-KPI pool of disclosed base metrics and financial figures
+    pool = _build_metrics_pool(merged, detected_boundary)
+    revenue = {y: pool[y].get("revenue_crore") for y in YEARS}
+
     # F1 first: its revenue is the denominator for every intensity KPI.
     order = ["F1"] + [k for k in KPI_IDS if k != "F1"]
     records = {}
-    revenue = {}
+
     for kid in order:
         kpi = KPI_BY_ID[kid]
         raw = merged.get(kid) or {}
@@ -873,13 +1156,124 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown", reporting_bounda
             slot["pages"] = list(slot.get("pages") or raw.get("pages") or [])
             for key in ("fy", "value", "unit", "text"):
                 slot.setdefault(key, None)
+
+            # Enrich missing inputs from cross-KPI metrics pool
+            p = pool.get(y) or {}
+            if kid == "E1":
+                if "renewable_energy" not in slot["inputs"] and "renewable_energy" in p:
+                    val, u = p["renewable_energy"]
+                    slot["inputs"]["renewable_energy"] = {"value": val, "unit": u}
+                if "total_energy" not in slot["inputs"] and "total_energy" in p:
+                    val, u = p["total_energy"]
+                    slot["inputs"]["total_energy"] = {"value": val, "unit": u}
+                if "non_renewable_energy" not in slot["inputs"] and "non_renewable_energy" in p:
+                    val, u = p["non_renewable_energy"]
+                    slot["inputs"]["non_renewable_energy"] = {"value": val, "unit": u}
+
+            elif kid == "E2":
+                if "total_energy" not in slot["inputs"] and "total_energy" in p:
+                    val, u = p["total_energy"]
+                    slot["inputs"]["total_energy"] = {"value": val, "unit": u}
+
+            elif kid == "E3":
+                if "scope1" not in slot["inputs"] and "scope1" in p:
+                    val, u = p["scope1"]
+                    slot["inputs"]["scope1"] = {"value": val, "unit": u}
+                if "scope2" not in slot["inputs"] and "scope2" in p:
+                    val, u = p["scope2"]
+                    slot["inputs"]["scope2"] = {"value": val, "unit": u}
+
+            elif kid == "E5":
+                if "sox" not in slot["inputs"] and "sox" in p:
+                    val, u = p["sox"]
+                    slot["inputs"]["sox"] = {"value": val, "unit": u}
+                if "nox" not in slot["inputs"] and "nox" in p:
+                    val, u = p["nox"]
+                    slot["inputs"]["nox"] = {"value": val, "unit": u}
+
+            elif kid == "E6":
+                if "water_consumption" not in slot["inputs"] and "water_consumption" in p:
+                    val, u = p["water_consumption"]
+                    slot["inputs"]["water_consumption"] = {"value": val, "unit": u}
+
+            elif kid == "E7":
+                if "water_recycled" not in slot["inputs"] and "water_recycled" in p:
+                    val, u = p["water_recycled"]
+                    slot["inputs"]["water_recycled"] = {"value": val, "unit": u}
+                if "water_consumption" not in slot["inputs"] and "water_consumption" in p:
+                    val, u = p["water_consumption"]
+                    slot["inputs"]["water_consumption"] = {"value": val, "unit": u}
+
+            elif kid == "E8":
+                if "total_waste" not in slot["inputs"] and "total_waste" in p:
+                    val, u = p["total_waste"]
+                    slot["inputs"]["total_waste"] = {"value": val, "unit": u}
+
+            elif kid == "E9":
+                if "waste_recovered" not in slot["inputs"] and "waste_recovered" in p:
+                    val, u = p["waste_recovered"]
+                    slot["inputs"]["waste_recovered"] = {"value": val, "unit": u}
+                if "total_waste" not in slot["inputs"] and "total_waste" in p:
+                    val, u = p["total_waste"]
+                    slot["inputs"]["total_waste"] = {"value": val, "unit": u}
+
+            elif kid == "S1":
+                if "employees" not in slot["components"] and "employees" in p:
+                    slot["components"]["employees"] = p["employees"]
+                if "workers" not in slot["components"] and "workers" in p:
+                    slot["components"]["workers"] = p["workers"]
+
+            elif kid == "S3":
+                if "injuries" not in slot["inputs"] and "injuries" in p:
+                    slot["inputs"]["injuries"] = {"value": p["injuries"], "unit": "count"}
+                if "hours_worked" not in slot["inputs"] and "hours_worked" in p:
+                    slot["inputs"]["hours_worked"] = {"value": p["hours_worked"], "unit": "hours"}
+
+            elif kid == "S4":
+                if "wellbeing_spend" not in slot["inputs"] and "wellbeing_spend" in p:
+                    val, u = p["wellbeing_spend"]
+                    slot["inputs"]["wellbeing_spend"] = {"value": val, "unit": u}
+                if "payroll" not in slot["inputs"] and "payroll" in p:
+                    val, u = p["payroll"]
+                    slot["inputs"]["payroll"] = {"value": val, "unit": u}
+
+            elif kid == "S6":
+                if "female_count" not in slot["inputs"] and "female_count" in p:
+                    slot["inputs"]["female_count"] = {"value": p["female_count"], "unit": "count"}
+                if "total_employees" not in slot["inputs"] and "total_headcount" in p:
+                    slot["inputs"]["total_employees"] = {"value": p["total_headcount"], "unit": "count"}
+
+            elif kid == "S13":
+                if "spent" not in slot["inputs"] and "csr_spent" in p:
+                    val, u = p["csr_spent"]
+                    slot["inputs"]["spent"] = {"value": val, "unit": u}
+                if "budgeted" not in slot["inputs"] and "csr_budgeted" in p:
+                    val, u = p["csr_budgeted"]
+                    slot["inputs"]["budgeted"] = {"value": val, "unit": u}
+
+            elif kid == "G1":
+                if "women_directors" not in slot["inputs"] and "women_directors" in p:
+                    slot["inputs"]["women_directors"] = {"value": p["women_directors"], "unit": "count"}
+                if "board_size" not in slot["inputs"] and "board_size" in p:
+                    slot["inputs"]["board_size"] = {"value": p["board_size"], "unit": "count"}
+
+            elif kid == "G2":
+                if "women_kmp" not in slot["inputs"] and "women_kmp" in p:
+                    slot["inputs"]["women_kmp"] = {"value": p["women_kmp"], "unit": "count"}
+                if "total_kmp" not in slot["inputs"] and "total_kmp" in p:
+                    slot["inputs"]["total_kmp"] = {"value": p["total_kmp"], "unit": "count"}
+
             year_notes = []
-            year_status[y] = _normalize_slot(kpi, slot, revenue.get(y), year_notes)
+            rev_denom = p.get("revenue_crore") or revenue.get(y)
+            year_status[y] = _normalize_slot(kpi, slot, rev_denom, year_notes)
             notes.extend(f"{y}: {n}" for n in year_notes)
             slots[y] = slot
+
         if kid == "F1":
             for y in YEARS:
-                revenue[y] = _revenue_crore(slots[y], boundary=detected_boundary)
+                if y not in revenue or not revenue[y]:
+                    revenue[y] = _revenue_crore(slots[y], boundary=detected_boundary)
+
         records[kid] = {
             "kpi_id": kid,
             "kpi_name": kpi["name"],
