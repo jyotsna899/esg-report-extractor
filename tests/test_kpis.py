@@ -333,3 +333,118 @@ def test_trailing_page_citations():
     # Undisclosed KPI returns 'Not Found'
     empty_rec = {"kpi_id": "E1", "current": {}, "previous": {}, "pages": []}
     assert get_kpi_page_citation(empty_rec, ["FY2024", "FY2025", "FY2026"]) == "Not Found"
+
+
+def test_hul_renewable_energy_and_energy_intensity_derivation():
+    # Test based on Hindustan Unilever (HUL) manager review:
+    # 1. Renewable Energy: 35,60,000 GJ renewable out of 36,51,000 GJ total -> 97.51%, overriding false 100%
+    # 2. Energy Intensity: 36,51,000 GJ * 1000 MJ/GJ / 60,000 cr revenue = 60,850 MJ per Rs. crore
+    hul_f1 = {
+        "kpi_id": "F1",
+        "current": {
+            "fy": "FY 2025-26",
+            "unit": "Rs. crore",
+            "components": {
+                "revenue": 60000,
+                "revenue_standalone": 58000,
+                "revenue_consolidated": 60000,
+                "boundary": "consolidated",
+            },
+        },
+    }
+    hul_e1 = {
+        "kpi_id": "E1",
+        "current": {
+            "fy": "FY 2025-26",
+            "value": 100.0,  # Erroneous headline 100%
+            "unit": "%",
+            "inputs": {
+                "renewable_energy": {"value": 3560000, "unit": "GJ"},
+                "total_energy": {"value": 3651000, "unit": "GJ"},
+            },
+        },
+    }
+    hul_e2 = {
+        "kpi_id": "E2",
+        "current": {
+            "fy": "FY 2025-26",
+            "value": 57500,  # Mismatched pre-printed intensity
+            "unit": "MJ per Rs. crore",
+            "inputs": {
+                "total_energy": {"value": 3651000, "unit": "GJ"},
+            },
+        },
+    }
+
+    by_id, records = run([hul_f1, hul_e1, hul_e2])
+
+    e1 = by_id["E1"]
+    assert e1["status"] == "derived"
+    assert e1["current"]["value"] == pytest.approx(97.51, rel=1e-3)
+    assert e1["current"]["unit"] == "%"
+
+    e2 = by_id["E2"]
+    assert e2["status"] == "derived"
+    # 3651000 GJ * 1000 MJ/GJ / 60000 cr = 60850 MJ / Rs. cr
+    assert e2["current"]["value"] == pytest.approx(60850.0, rel=1e-3)
+    assert e2["current"]["unit"] == "MJ per Rs. crore"
+
+
+def test_reporting_boundary_revenue_denominator():
+    # Standalone boundary vs Consolidated boundary
+    f1_both = {
+        "kpi_id": "F1",
+        "current": {
+            "fy": "FY 2025-26",
+            "unit": "Rs. crore",
+            "components": {
+                "revenue_standalone": 50000,
+                "revenue_consolidated": 60000,
+                "boundary": "consolidated",
+            },
+        },
+    }
+    e2_input = {
+        "kpi_id": "E2",
+        "current": {
+            "fy": "FY 2025-26",
+            "inputs": {
+                "total_energy": {"value": 3000000, "unit": "GJ"},
+            },
+        },
+    }
+
+    # Consolidated boundary: revenue = 60,000 -> 3,000,000 * 1000 / 60,000 = 50,000 MJ/cr
+    by_id_con, _ = run([f1_both, e2_input])
+    assert by_id_con["E2"]["current"]["value"] == pytest.approx(50000.0)
+
+    # Standalone boundary: revenue = 50,000 -> 3,000,000 * 1000 / 50,000 = 60,000 MJ/cr
+    f1_both["current"]["components"]["boundary"] = "standalone"
+    by_id_std, _ = run([f1_both, e2_input])
+    assert by_id_std["E2"]["current"]["value"] == pytest.approx(60000.0)
+
+
+def test_s3_and_s4_derivations():
+    s3_kpi = {
+        "kpi_id": "S3",
+        "current": {
+            "inputs": {
+                "injuries": {"value": 5},
+                "hours_worked": {"value": 5000000},
+            }
+        },
+    }
+    s4_kpi = {
+        "kpi_id": "S4",
+        "current": {
+            "inputs": {
+                "wellbeing_spend": {"value": 25, "unit": "Rs. crore"},
+                "payroll": {"value": 500, "unit": "Rs. crore"},
+            }
+        },
+    }
+    by_id, _ = run([s3_kpi, s4_kpi])
+    assert by_id["S3"]["current"]["value"] == pytest.approx(1.0)
+    assert by_id["S3"]["current"]["unit"] == "per million hours worked"
+    assert by_id["S4"]["current"]["value"] == pytest.approx(5.0)
+    assert by_id["S4"]["current"]["unit"] == "%"

@@ -764,9 +764,11 @@ def render_detail_tab(name: str, data: dict):
     multi_df = company_multi_year_frame(data)
     cov = kpi_coverage(kpis)
 
+    boundary = data.get("reporting_boundary") or (kpis[0].get("reporting_boundary") if kpis else None) or "Standalone"
     st.subheader(f"{name} — Multi-Year KPI Trend")
     st.caption(
-        f"{cov['disclosed']}/{cov['total']} KPIs disclosed ({cov['derived']} derived). "
+        f"{cov['disclosed']}/{cov['total']} KPIs disclosed ({cov['derived']} derived) · "
+        f"Reporting boundary: **{boundary.capitalize()}** · "
         "Side-by-side historical comparison across financial years."
     )
 

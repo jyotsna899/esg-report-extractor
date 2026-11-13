@@ -334,8 +334,8 @@ water recycling rate not printed -> give water_recycled and water_consumption in
 KPI LIST (ID | Name | Required unit/format | components / inputs):
 {kpi_block}
 
-Return ONLY a valid JSON object with exactly two keys, "kpis" and "topics". No preamble, no \
-markdown fences.
+Return ONLY a valid JSON object with keys: "kpis", "topics", and optionally "reporting_boundary". \
+No preamble, no markdown fences.
 
 1. "kpis": a list of objects, one per KPI found:
    {{
@@ -350,9 +350,12 @@ markdown fences.
    }}
    - Use "components" for KPIs that list components (e.g. S10 filed/resolved/pending, F1 \
 revenue/ebitda/pat, S12 budgeted/spent, G3 count/pct, E10 status/target_year/scope).
-   - For F1, use revenue from operations (standalone if both standalone and consolidated are \
-shown, and say which in "text"). Put the printed money unit (e.g. "Rs. crore", "Rs. lakh", \
-"Rs. million") in "unit".
+   - For F1: extract revenue from operations, EBITDA, and PAT. If both standalone and consolidated \
+are reported, put standalone in components.revenue_standalone, consolidated in components.revenue_consolidated, \
+and reporting boundary ('standalone' or 'consolidated') in components.boundary. Put the printed money unit in "unit".
+   - For E1: ALWAYS extract both renewable_energy and total_energy (and non_renewable_energy if shown) \
+into "inputs" with their units (e.g. GJ or MWh), even if a pre-calculated % is printed.
+   - For E2: ALWAYS extract raw total_energy consumption (e.g. in GJ) into "inputs" with its unit.
    - For Yes/No KPIs (E10, G5, G7, G8, G9, G10) put "Yes"/"No" (or the assurance level for \
 G8) in components.status and names/frameworks/years/providers in components.detail or the \
 listed components.
@@ -360,6 +363,9 @@ listed components.
 2. "topics": a navigation index of every distinct subject discussed in this text, including \
 prose-only subjects (e.g. "Rainwater harvesting", "Board diversity policy"). For each: \
 {{"topic": short phrase (3-6 words), "pages": [page numbers]}}.
+
+3. "reporting_boundary": "standalone" | "consolidated" | null (extract if this text explicitly \
+states whether the BRSR reporting boundary is standalone or consolidated).
 
 If nothing is found for a key, return [] for it.
 
@@ -403,6 +409,7 @@ def extract_kpis(
     per_chunk_kpis = []
     topic_index = []
     debug_log = []
+    detected_boundary = None
     kpi_block = build_kpi_prompt_block()
 
     for idx, chunk in enumerate(chunks):
@@ -456,6 +463,9 @@ def extract_kpis(
 
             chunk_kpis = parsed.get("kpis", []) or []
             chunk_topics = parsed.get("topics", []) or []
+            chunk_b = parsed.get("reporting_boundary")
+            if chunk_b and str(chunk_b).lower() in ("standalone", "consolidated") and not detected_boundary:
+                detected_boundary = str(chunk_b).lower()
             per_chunk_kpis.append(chunk_kpis)
 
             for t in chunk_topics:
@@ -486,7 +496,7 @@ def extract_kpis(
                 "detail": f"{e}. finish_reason={finish_reason}{truncation_note} Raw response (first 500 chars): {raw[:500]!r}",
             })
 
-    kpis = normalize_kpis(merge_chunk_kpis(per_chunk_kpis), company_name)
+    kpis = normalize_kpis(merge_chunk_kpis(per_chunk_kpis), company_name, reporting_boundary=detected_boundary)
     gc.collect()
     return kpis, debug_log, topic_index, page_map
 

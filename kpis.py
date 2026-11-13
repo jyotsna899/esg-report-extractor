@@ -32,7 +32,7 @@ KPI_CATALOG = [
     # ---------------- ENVIRONMENT ----------------
     {"id": "E1", "name": "Renewable Energy Share", "category": "Environment",
      "required_unit": "% of total energy consumption", "unit_kind": "pct", "direction": "higher",
-     "inputs": ["renewable_energy", "total_energy"]},
+     "inputs": ["renewable_energy", "total_energy", "non_renewable_energy"]},
     {"id": "E2", "name": "Energy Intensity", "category": "Environment",
      "required_unit": "MJ per Rs. crore of revenue", "unit_kind": "energy_int", "direction": "lower",
      "inputs": ["total_energy"]},
@@ -69,9 +69,11 @@ KPI_CATALOG = [
      "required_unit": "number (employees and workers separately)", "unit_kind": "count", "direction": "lower",
      "components": ["employees", "workers"]},
     {"id": "S3", "name": "LTIFR", "category": "Social",
-     "required_unit": "rate per million hours worked", "unit_kind": "rate_pmh", "direction": "lower"},
+     "required_unit": "rate per million hours worked", "unit_kind": "rate_pmh", "direction": "lower",
+     "inputs": ["injuries", "hours_worked"]},
     {"id": "S4", "name": "Employee Well-being Investment", "category": "Social",
-     "required_unit": "% of total payroll/revenue as reported", "unit_kind": "pct", "direction": "higher"},
+     "required_unit": "% of total payroll/revenue as reported", "unit_kind": "pct", "direction": "higher",
+     "inputs": ["wellbeing_spend", "payroll"]},
     {"id": "S5", "name": "Attrition Rate", "category": "Social",
      "required_unit": "%", "unit_kind": "pct", "direction": "lower"},
     {"id": "S6", "name": "Gender Diversity Ratio", "category": "Social",
@@ -135,7 +137,7 @@ KPI_CATALOG = [
     # ---------------- FINANCIAL ----------------
     {"id": "F1", "name": "Revenue, EBITDA, PAT", "category": "Financial",
      "required_unit": "Rs. crore (three separate values)", "unit_kind": "money", "direction": None,
-     "components": ["revenue", "ebitda", "pat"]},
+     "components": ["revenue", "ebitda", "pat", "revenue_standalone", "revenue_consolidated", "boundary"]},
     {"id": "F2", "name": "Green Capex and Total Capex", "category": "Financial",
      "required_unit": "Rs. crore + green capex as % of total", "unit_kind": "money", "direction": "higher",
      "components": ["green_capex", "total_capex", "green_pct"]},
@@ -149,25 +151,30 @@ assert len(set(KPI_IDS)) == KPI_COUNT, "duplicate KPI id in KPI_CATALOG"
 # Short guidance for the LLM on the inputs it should report whenever the KPI
 # itself is not printed in the required unit. Keys must match "inputs" above.
 INPUT_HINTS = {
-    "renewable_energy": "energy from renewable sources (value + unit)",
-    "total_energy": "total energy consumption (value + unit, e.g. GJ)",
-    "scope1": "Scope 1 emissions (value + unit)",
-    "scope2": "Scope 2 emissions (value + unit)",
-    "sox": "SOx emissions (value + unit)",
-    "nox": "NOx emissions (value + unit)",
-    "water_consumption": "total water consumption (value + unit)",
-    "water_recycled": "water recycled/reused (value + unit)",
-    "total_waste": "total waste generated (value + unit)",
-    "waste_recovered": "waste recycled + re-used + otherwise recovered (value + unit)",
+    "renewable_energy": "energy from renewable sources (value + unit, e.g. GJ or MWh)",
+    "non_renewable_energy": "energy from non-renewable sources (value + unit, e.g. GJ)",
+    "total_energy": "total energy consumption including renewable and non-renewable (value + unit, e.g. GJ)",
+    "scope1": "Scope 1 emissions (value + unit, e.g. tCO2e)",
+    "scope2": "Scope 2 emissions (value + unit, e.g. tCO2e)",
+    "sox": "SOx emissions (value + unit, e.g. MT or kg)",
+    "nox": "NOx emissions (value + unit, e.g. MT or kg)",
+    "water_consumption": "total water consumption (value + unit, e.g. kL or ML)",
+    "water_recycled": "water recycled/reused (value + unit, e.g. kL)",
+    "total_waste": "total waste generated (value + unit, e.g. metric tonnes)",
+    "waste_recovered": "waste recycled + re-used + recovered (value + unit, e.g. metric tonnes)",
+    "injuries": "number of lost time injuries",
+    "hours_worked": "total person-hours worked during the financial year",
+    "wellbeing_spend": "amount spent on employee well-being (Rs. crore or Lakh)",
+    "payroll": "total employee benefit expense / payroll (Rs. crore)",
     "employees": "number of permanent + other employees",
     "workers": "number of permanent + other workers",
     "female_count": "number of female employees + workers",
     "male_count": "number of male employees + workers",
-    "highest_paid": "remuneration of the highest-paid person",
-    "median_remuneration": "median remuneration of employees",
+    "highest_paid": "remuneration of the highest-paid person (Rs. crore or INR)",
+    "median_remuneration": "median remuneration of employees (Rs. crore or INR)",
     "median_female_pay": "median remuneration of female employees",
     "median_male_pay": "median remuneration of male employees",
-    "employees_trained": "number of employees who received training",
+    "employees_trained": "number of employees who received skill/safety training",
     "total_employees": "total employees used as the training denominator",
     "women_directors": "number of women on the board",
     "board_size": "total number of directors on the board",
@@ -504,12 +511,27 @@ def _ratio_pct(a, b):
     return a / b * 100.0
 
 
-def _revenue_crore(f1_slot):
-    rev = _num_component(f1_slot, "revenue")
-    if rev is None:
+def _revenue_crore(f1_slot, boundary: str | None = None):
+    if not f1_slot:
         return None
-    factor = _money_to_crore(f1_slot.get("unit") or "")
-    return rev * factor if factor is not None else None
+    factor = _money_to_crore(f1_slot.get("unit") or "") or 1.0
+    comps = f1_slot.get("components") or {}
+    b = str(boundary or comps.get("boundary") or f1_slot.get("text") or "").lower()
+
+    rev_std = _num_component(f1_slot, "revenue_standalone")
+    rev_con = _num_component(f1_slot, "revenue_consolidated")
+    rev_gen = _num_component(f1_slot, "revenue")
+    if rev_gen is None and f1_slot.get("value") is not None:
+        rev_gen = to_number(f1_slot["value"])
+
+    if "consolidat" in b:
+        rev = rev_con if rev_con is not None else (rev_gen if rev_gen is not None else rev_std)
+    elif "standalone" in b:
+        rev = rev_std if rev_std is not None else (rev_gen if rev_gen is not None else rev_con)
+    else:
+        rev = rev_gen if rev_gen is not None else (rev_con if rev_con is not None else rev_std)
+
+    return rev * factor if rev is not None else None
 
 
 def _normalize_slot(kpi, slot, revenue_cr, notes):
@@ -563,6 +585,40 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
 
     # ---- percentages ----
     if kind == "pct":
+        # E1: Renewable Energy Share %
+        if kid == "E1":
+            ren_val, ren_u = _input(slot, "renewable_energy")
+            tot_val, tot_u = _input(slot, "total_energy")
+            non_val, non_u = _input(slot, "non_renewable_energy")
+            if ren_val is not None and tot_val is None and non_val is not None:
+                tot_val = ren_val + non_val
+                tot_u = ren_u
+            if ren_val is not None and tot_val and _same_unit(ren_u, tot_u):
+                derived_pct = round((ren_val / tot_val) * 100.0, 2)
+                orig_val = slot["value"]
+                # If reported value is missing, differs by > 2%, or is 100% when ren < tot, use derived
+                if orig_val is None or (orig_val == 100.0 and derived_pct < 99.5) or abs(orig_val - derived_pct) > 2.0:
+                    slot["value"] = derived_pct
+                    slot["unit"] = "%"
+                    notes.append(f"renewable {_fmt(ren_val)} / total {_fmt(tot_val)} × 100 = {derived_pct:.2f}%")
+                    return done("derived")
+                else:
+                    slot["unit"] = "%"
+                    return done("reported")
+
+        # S4: Employee Well-being Investment %
+        if kid == "S4":
+            spend, su = _input(slot, "wellbeing_spend")
+            pay, pu = _input(slot, "payroll")
+            if spend is not None and pay:
+                sf = _money_to_crore(su or "") or 1.0
+                pf = _money_to_crore(pu or "") or 1.0
+                pct = round(((spend * sf) / (pay * pf)) * 100.0, 2)
+                slot["value"] = pct
+                slot["unit"] = "%"
+                notes.append(f"well-being spend {_fmt(spend)} / payroll {_fmt(pay)} × 100 = {pct:.2f}%")
+                return done("derived")
+
         if slot["value"] is not None:
             if _is_pct_unit(slot["unit"]):
                 slot["unit"] = "%"
@@ -574,6 +630,7 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 slot["unit"] = "%"
                 return done("derived")
             return done("reported_unit_mismatch")
+
         if kid == "S6":
             fp = _num_component(slot, "female_pct")
             mp = _num_component(slot, "male_pct")
@@ -593,6 +650,7 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 slot["components"]["female_pct"] = round(100 - mp, 2)
             slot["unit"] = "%"
             return done("reported")
+
         pairs = {
             "E1": ("renewable_energy", "total_energy"),
             "E7": ("water_recycled", "water_consumption"),
@@ -617,21 +675,7 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
     # ---- intensities ----
     if kind in INTENSITY_KINDS:
         conv, target = INTENSITY_KINDS[kind]
-        if slot["value"] is not None:
-            num, den = _split_ratio_unit(slot["unit"] or "")
-            nf = conv(num) if num else None
-            df = _per_crore_factor(den)
-            if nf is None or df is None:
-                return done("reported_unit_mismatch")
-            if nf == 1.0 and df == 1.0:
-                slot["unit"] = target
-                return done("reported")
-            orig = slot["value"]
-            slot["value"] = orig * nf * df
-            notes.append(f"{_fmt(orig)} {slot['unit']} × {nf:g} × {df:g} = {_fmt(slot['value'])} {target}")
-            slot["unit"] = target
-            return done("derived")
-        # compute absolute / revenue
+        # First priority: compute from raw physical inputs and revenue_cr
         names = kpi.get("inputs") or []
         total, parts = 0.0, []
         for name in names:
@@ -645,10 +689,39 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 break
             total += v * f
             parts.append(f"{name} {_fmt(v)} {u or ''}".strip())
+
         if total is not None and names and revenue_cr:
-            slot["value"] = total / revenue_cr
+            derived_int = round(total / revenue_cr, 4)
+            orig_val = slot["value"]
+            orig_u = _clean_unit(slot.get("unit"))
+            # If reported value is missing, not in standard target unit, or differs by > 5%, use derived
+            if orig_val is None or target.lower() not in orig_u:
+                slot["value"] = derived_int
+                slot["unit"] = target
+                notes.append(f"({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target}")
+                return done("derived")
+            elif abs(orig_val - derived_int) / max(derived_int, 1.0) > 0.05:
+                slot["value"] = derived_int
+                slot["unit"] = target
+                notes.append(f"derived: ({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target} (replaces reported {_fmt(orig_val)})")
+                return done("derived")
+            else:
+                slot["unit"] = target
+                return done("reported")
+
+        if slot["value"] is not None:
+            num, den = _split_ratio_unit(slot["unit"] or "")
+            nf = conv(num) if num else None
+            df = _per_crore_factor(den)
+            if nf is None or df is None:
+                return done("reported_unit_mismatch")
+            if nf == 1.0 and df == 1.0:
+                slot["unit"] = target
+                return done("reported")
+            orig = slot["value"]
+            slot["value"] = orig * nf * df
+            notes.append(f"{_fmt(orig)} {slot['unit']} × {nf:g} × {df:g} = {_fmt(slot['value'])} {target}")
             slot["unit"] = target
-            notes.append(f"({' + '.join(parts)}) / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target}")
             return done("derived")
         if slot["text"]:
             return done("reported")
@@ -671,6 +744,14 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
 
     # ---- LTIFR ----
     if kind == "rate_pmh":
+        inj, _ = _input(slot, "injuries")
+        hrs, _ = _input(slot, "hours_worked")
+        if inj is not None and hrs:
+            ltifr = round((inj * 1_000_000.0) / hrs, 4)
+            slot["value"] = ltifr
+            slot["unit"] = "per million hours worked"
+            notes.append(f"injuries {_fmt(inj)} × 1,000,000 / hours {_fmt(hrs)} = {slot['value']} per million hours")
+            return done("derived")
         if slot["value"] is None:
             return done("reported" if slot["text"] else "not_disclosed")
         u = _clean_unit(slot["unit"]).replace(",", "").replace(" ", "")
@@ -710,6 +791,18 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 slot["components"].setdefault("employees", e)
                 slot["components"].setdefault("workers", w)
                 status = "derived"
+        if kid == "S2":
+            emp = _num_component(slot, "employees")
+            wrk = _num_component(slot, "workers")
+            if emp is None and wrk is None:
+                emp, _ = _input(slot, "employees")
+                wrk, _ = _input(slot, "workers")
+            if emp is not None or wrk is not None:
+                tot = (emp or 0) + (wrk or 0)
+                slot["value"] = int(tot) if float(tot).is_integer() else tot
+                slot["components"].setdefault("employees", emp if emp is not None else 0)
+                slot["components"].setdefault("workers", wrk if wrk is not None else 0)
+                status = "reported"
         if kid == "G3" and slot["components"].get("pct") is None:
             c = _num_component(slot, "count")
             if c is None and slot["value"] is not None:
@@ -742,9 +835,27 @@ def _same_unit(a, b) -> bool:
 _STATUS_RANK = {"not_disclosed": 0, "reported_unit_mismatch": 1, "derived": 2, "reported": 3}
 
 
-def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
+def normalize_kpis(merged: dict, company_name: str = "Unknown", reporting_boundary: str | None = None) -> list[dict]:
     """Always returns exactly one record per catalog KPI, in catalog order."""
     merged = merged or {}
+    f1_raw = merged.get("F1") or {}
+    detected_boundary = reporting_boundary
+    if not detected_boundary:
+        for y in YEARS:
+            comps = (f1_raw.get(y) or {}).get("components") or {}
+            b = comps.get("boundary")
+            if b and str(b).lower() in ("standalone", "consolidated"):
+                detected_boundary = str(b).lower()
+                break
+            txt = str((f1_raw.get(y) or {}).get("text") or "").lower()
+            if "consolidat" in txt:
+                detected_boundary = "consolidated"
+                break
+            elif "standalone" in txt:
+                detected_boundary = "standalone"
+                break
+    detected_boundary = detected_boundary or "standalone"
+
     # F1 first: its revenue is the denominator for every intensity KPI.
     order = ["F1"] + [k for k in KPI_IDS if k != "F1"]
     records = {}
@@ -768,7 +879,7 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
             slots[y] = slot
         if kid == "F1":
             for y in YEARS:
-                revenue[y] = _revenue_crore(slots[y])
+                revenue[y] = _revenue_crore(slots[y], boundary=detected_boundary)
         records[kid] = {
             "kpi_id": kid,
             "kpi_name": kpi["name"],
@@ -781,6 +892,7 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown") -> list[dict]:
             "source_context": raw.get("source_context"),
             "pages": list(raw.get("pages") or []),
             "company": company_name,
+            "reporting_boundary": detected_boundary,
         }
 
     # S13 from S12 components when S13 itself wasn't printed.
