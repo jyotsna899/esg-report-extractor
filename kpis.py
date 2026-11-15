@@ -75,7 +75,8 @@ KPI_CATALOG = [
      "required_unit": "% of total payroll/revenue as reported", "unit_kind": "pct", "direction": "higher",
      "inputs": ["wellbeing_spend", "payroll"]},
     {"id": "S5", "name": "Attrition Rate", "category": "Social",
-     "required_unit": "%", "unit_kind": "pct", "direction": "lower"},
+     "required_unit": "%", "unit_kind": "pct", "direction": "lower",
+     "components": ["permanent_employees", "permanent_workers", "total"], "inputs": ["turnover_rate"]},
     {"id": "S6", "name": "Gender Diversity Ratio", "category": "Social",
      "required_unit": "% female, % male", "unit_kind": "pct", "direction": None,
      "components": ["female_pct", "male_pct"], "inputs": ["female_count", "male_count"]},
@@ -87,7 +88,7 @@ KPI_CATALOG = [
      "inputs": ["median_female_pay", "median_male_pay"]},
     {"id": "S9", "name": "Training Coverage", "category": "Social",
      "required_unit": "% of employees trained", "unit_kind": "pct", "direction": "higher",
-     "inputs": ["employees_trained", "total_employees"]},
+     "components": ["employees", "workers"], "inputs": ["employees_trained", "total_employees"]},
     {"id": "S10", "name": "POSH Complaints", "category": "Social",
      "required_unit": "filed, resolved, pending", "unit_kind": "count", "direction": None,
      "components": ["filed", "resolved", "pending"]},
@@ -101,11 +102,14 @@ KPI_CATALOG = [
      "required_unit": "% (spent / budgeted)", "unit_kind": "pct", "direction": "higher",
      "inputs": ["spent", "budgeted"]},
     {"id": "S14", "name": "Rural & Semi-Urban Job Creation", "category": "Social",
-     "required_unit": "headcount or % of total", "unit_kind": "text", "direction": "higher"},
+     "required_unit": "% of total wage cost in smaller towns/rural", "unit_kind": "pct", "direction": "higher",
+     "components": ["rural", "semi_urban", "total_pct"], "inputs": ["rural_wages_pct", "semi_urban_wages_pct"]},
     {"id": "S15", "name": "Investment in Aspirational Districts", "category": "Social",
-     "required_unit": "Rs. crore", "unit_kind": "money", "direction": "higher"},
+     "required_unit": "Rs. crore", "unit_kind": "money", "direction": "higher",
+     "components": ["spent"]},
     {"id": "S16", "name": "Social Targets & Commitments", "category": "Social",
-     "required_unit": "Text", "unit_kind": "text", "direction": None},
+     "required_unit": "Text", "unit_kind": "text", "direction": None,
+     "components": ["status", "detail"]},
     # ---------------- GOVERNANCE ----------------
     {"id": "G1", "name": "Board Gender Diversity", "category": "Governance",
      "required_unit": "% women on board", "unit_kind": "pct", "direction": "higher",
@@ -117,12 +121,14 @@ KPI_CATALOG = [
      "required_unit": "number and % of board", "unit_kind": "count", "direction": "higher",
      "components": ["count", "pct"], "inputs": ["board_size"]},
     {"id": "G4", "name": "Board Committees", "category": "Governance",
-     "required_unit": "number of active committees", "unit_kind": "count", "direction": None},
+     "required_unit": "number of active committees", "unit_kind": "count", "direction": None,
+     "components": ["count", "committees"]},
     {"id": "G5", "name": "Dedicated ESG Committee", "category": "Governance",
      "required_unit": "Yes/No (+ committee name)", "unit_kind": "text", "direction": None,
      "components": ["status", "detail"]},
     {"id": "G6", "name": "Board Attendance Rate", "category": "Governance",
-     "required_unit": "average % for the year", "unit_kind": "pct", "direction": "higher"},
+     "required_unit": "average % for the year", "unit_kind": "pct", "direction": "higher",
+     "components": ["attendance_pct"]},
     {"id": "G7", "name": "Sustainability Report Released", "category": "Governance",
      "required_unit": "Yes/No + framework (BRSR, GRI, etc.)", "unit_kind": "text", "direction": None,
      "components": ["status", "detail"]},
@@ -137,11 +143,11 @@ KPI_CATALOG = [
      "components": ["status", "detail"]},
     # ---------------- FINANCIAL ----------------
     {"id": "F1", "name": "Revenue, EBITDA, PAT", "category": "Financial",
-     "required_unit": "Rs. crore (three separate values)", "unit_kind": "money", "direction": None,
-     "components": ["revenue", "ebitda", "pat", "revenue_standalone", "revenue_consolidated", "boundary"]},
+     "required_unit": "Rs. crore (Turnover / Revenue from Operations; EBITDA & PAT if disclosed)", "unit_kind": "money", "direction": None,
+     "components": ["revenue", "turnover", "ebitda", "pat", "revenue_standalone", "revenue_consolidated", "boundary"]},
     {"id": "F2", "name": "Green Capex and Total Capex", "category": "Financial",
-     "required_unit": "Rs. crore + green capex as % of total", "unit_kind": "money", "direction": "higher",
-     "components": ["green_capex", "total_capex", "green_pct"]},
+     "required_unit": "% of CAPEX in environmental/social tech (or Rs. crore)", "unit_kind": "money", "direction": "higher",
+     "components": ["green_pct", "rd_pct", "green_capex", "total_capex"], "inputs": ["green_capex", "total_capex"]},
 ]
 
 KPI_BY_ID = {k["id"]: k for k in KPI_CATALOG}
@@ -183,6 +189,11 @@ INPUT_HINTS = {
     "total_kmp": "total number of KMPs",
     "spent": "actual amount spent on CSR (Rs. crore or Lakh)",
     "budgeted": "budgeted or mandated CSR obligation amount (Rs. crore or Lakh)",
+    "rural_wages_pct": "percentage of wages paid in rural areas (% of total wage cost)",
+    "semi_urban_wages_pct": "percentage of wages paid in semi-urban areas (% of total wage cost)",
+    "turnover_rate": "employee turnover / attrition rate (%)",
+    "green_capex": "amount invested in green/environmental/social CAPEX (Rs. crore)",
+    "total_capex": "total CAPEX (Rs. crore)",
 }
 
 # Explicit formula definitions for all derived / calculable KPIs
@@ -199,15 +210,19 @@ KPI_FORMULAS = {
     "S2": "employee_fatalities + worker_fatalities",
     "S3": "(injuries * 1,000,000) / hours_worked",
     "S4": "(wellbeing_spend / payroll) * 100",
+    "S5": "permanent_employees_turnover_rate",
     "S6": "(female_count / total_headcount) * 100",
     "S7": "highest_paid / median_remuneration",
     "S8": "median_female_pay / median_male_pay",
     "S9": "(employees_trained / total_employees) * 100",
     "S13": "(spent / budgeted) * 100",
+    "S14": "rural_wages_pct + semi_urban_wages_pct",
     "G1": "(women_directors / board_size) * 100",
     "G2": "(women_kmp / total_kmp) * 100",
     "G3": "independent_directors_count",
-    "F1": "revenue from operations (standalone & consolidated)",
+    "G4": "count of active committees",
+    "G6": "board_attendance_pct",
+    "F1": "Turnover / Revenue from Operations (standalone & consolidated in Rs. crore)",
     "F2": "(green_capex / total_capex) * 100",
 }
 
@@ -557,9 +572,9 @@ def _revenue_crore(f1_slot, boundary: str | None = None):
     comps = f1_slot.get("components") or {}
     b = str(boundary or comps.get("boundary") or f1_slot.get("text") or "").lower()
 
-    rev_std = _num_component(f1_slot, "revenue_standalone")
-    rev_con = _num_component(f1_slot, "revenue_consolidated")
-    rev_gen = _num_component(f1_slot, "revenue")
+    rev_std = _num_component(f1_slot, "revenue_standalone") or _num_component(f1_slot, "turnover_standalone")
+    rev_con = _num_component(f1_slot, "revenue_consolidated") or _num_component(f1_slot, "turnover_consolidated")
+    rev_gen = _num_component(f1_slot, "revenue") or _num_component(f1_slot, "turnover")
     if rev_gen is None and f1_slot.get("value") is not None:
         rev_gen = to_number(f1_slot["value"])
 
@@ -592,6 +607,8 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
         has_any = slot["value"] is not None or any(
             to_number(v) is not None for k, v in slot["components"].items() if not k.endswith("_pct")
         )
+        if slot.get("status") == "derived":
+            tag = "derived"
         if has_any:
             factor = _money_to_crore(slot["unit"] or "")
             if factor is None:
@@ -760,6 +777,55 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 notes.append(f"women KMP {_fmt(wk)} / total KMP {_fmt(tk)} × 100 = {derived_pct:.2f}%{rep_note}")
                 return done("derived")
 
+        # S5: Attrition / Turnover Rate %
+        if kid == "S5":
+            tr, _ = _input(slot, "turnover_rate")
+            if tr is not None:
+                orig_val = slot["value"]
+                slot["value"] = tr
+                slot["unit"] = "%"
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != tr) else ""
+                notes.append(f"turnover rate = {tr}%{rep_note}")
+                return done("derived")
+            pe = _num_component(slot, "permanent_employees")
+            if pe is not None and slot["value"] is None:
+                slot["value"] = pe
+                slot["unit"] = "%"
+                return done("reported")
+            tot = _num_component(slot, "total") or _num_component(slot, "turnover")
+            if tot is not None and slot["value"] is None:
+                slot["value"] = tot
+                slot["unit"] = "%"
+                return done("reported")
+
+        # S14: Rural & Semi-Urban Job Creation %
+        if kid == "S14":
+            rw, _ = _input(slot, "rural_wages_pct")
+            if rw is None:
+                rw = _num_component(slot, "rural")
+            suw, _ = _input(slot, "semi_urban_wages_pct")
+            if suw is None:
+                suw = _num_component(slot, "semi_urban")
+            if rw is not None or suw is not None:
+                tot_pct = round((rw or 0.0) + (suw or 0.0), 2)
+                orig_val = slot["value"]
+                slot["value"] = tot_pct
+                slot["unit"] = "%"
+                slot["components"]["rural"] = rw
+                slot["components"]["semi_urban"] = suw
+                slot["components"]["total_pct"] = tot_pct
+                rep_note = f" (replaces reported {_fmt(orig_val)})" if (orig_val is not None and orig_val != tot_pct) else ""
+                notes.append(f"rural wages {_fmt(rw)}% + semi-urban {_fmt(suw)}% = {tot_pct}%{rep_note}")
+                return done("derived")
+
+        # G6: Board Attendance Rate %
+        if kid == "G6":
+            att = _num_component(slot, "attendance_pct") or _num_component(slot, "attendance")
+            if att is not None and slot["value"] is None:
+                slot["value"] = att
+                slot["unit"] = "%"
+                return done("reported")
+
         if slot["value"] is not None:
             if _is_pct_unit(slot["unit"]):
                 slot["unit"] = "%"
@@ -805,18 +871,40 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
 
         if slot["value"] is not None:
             num, den = _split_ratio_unit(slot["unit"] or "")
-            nf = conv(num) if num else None
+            nf = conv(num) if num else 1.0
             df = _per_crore_factor(den)
-            if nf is None or df is None:
-                return done("reported_unit_mismatch")
-            if nf == 1.0 and df == 1.0:
+            # Case A: Denominator is already per crore (or convertible)
+            if df is not None:
+                orig = slot["value"]
+                factor = (nf or 1.0) * df
+                slot["value"] = round(orig * factor, 2) if kind == "energy_int" else round(orig * factor, 4)
+                if factor != 1.0:
+                    notes.append(f"{_fmt(orig)} {slot['unit']} × {(nf or 1.0):g} × {df:g} = {_fmt(slot['value'])} {target}")
                 slot["unit"] = target
-                return done("reported")
-            orig = slot["value"]
-            slot["value"] = orig * nf * df
-            notes.append(f"{_fmt(orig)} {slot['unit']} × {nf:g} × {df:g} = {_fmt(slot['value'])} {target}")
-            slot["unit"] = target
-            return done("derived")
+                return done("derived" if factor != 1.0 else "reported")
+
+            # Case B: Denominator was missing, but revenue_cr is available -> compute intensity from raw numerator!
+            if not den and revenue_cr and revenue_cr > 0:
+                orig = slot["value"]
+                num_scaled = orig * (nf or 1.0)
+                derived_int = round(num_scaled / revenue_cr, 2) if kind == "energy_int" else round(num_scaled / revenue_cr, 4)
+                slot["value"] = derived_int
+                slot["unit"] = target
+                notes.append(f"derived: {_fmt(num_scaled)} / revenue {_fmt(revenue_cr)} Rs. crore = {_fmt(slot['value'])} {target}")
+                return done("derived")
+
+            # Case C: Denominator missing and revenue_cr unavailable, but value looks like an intensity
+            if not den:
+                if kind == "energy_int" and 10 <= slot["value"] <= 500:
+                    slot["value"] = round(slot["value"] * 1000.0, 2)
+                    slot["unit"] = target
+                    notes.append(f"assumed GJ/crore: scaled × 1000 = {_fmt(slot['value'])} {target}")
+                    return done("derived")
+                elif kind in ("emission_int", "water_int", "waste_int") and slot["value"] < 1000:
+                    slot["unit"] = target
+                    return done("reported")
+
+            return done("reported_unit_mismatch")
         if slot["text"]:
             return done("reported")
         return done("not_disclosed")
@@ -921,6 +1009,21 @@ def _normalize_slot(kpi, slot, revenue_cr, notes):
                 slot["components"]["pct"] = round(pct, 2)
                 notes.append(f"{_fmt(c)} independent / {_fmt(b)} directors × 100 = {pct:.2f}%")
                 status = "derived"
+        if kid == "G4":
+            c = _num_component(slot, "count")
+            if c is None and slot["value"] is not None:
+                c = slot["value"]
+                slot["components"]["count"] = c
+            if c is None:
+                comms = slot["components"].get("committees")
+                if isinstance(comms, list) and comms:
+                    c = len(comms)
+                    slot["value"] = c
+                    slot["components"]["count"] = c
+                    status = "derived"
+            elif slot["value"] is None:
+                slot["value"] = c
+                status = "reported"
         if status:
             return done(status)
         if slot["value"] is not None or slot["components"] or slot["text"]:
@@ -1111,6 +1214,50 @@ def _build_metrics_pool(merged: dict, detected_boundary: str | None = None) -> d
         if tc_v is not None:
             p["total_capex"] = tc_v
 
+        # 12. Rural & Semi-Urban Jobs
+        rw_v, _ = get_inp("S14", "rural_wages_pct")
+        if rw_v is None:
+            rw_v, _ = get_comp("S14", "rural")
+        suw_v, _ = get_inp("S14", "semi_urban_wages_pct")
+        if suw_v is None:
+            suw_v, _ = get_comp("S14", "semi_urban")
+        if rw_v is not None:
+            p["rural_wages_pct"] = rw_v
+        if suw_v is not None:
+            p["semi_urban_wages_pct"] = suw_v
+
+        # 13. Back-calculate revenue if missing from F1
+        if p.get("revenue_crore") is None:
+            tot_e, _ = p.get("total_energy", (None, None))
+            e2_s = (merged.get("E2") or {}).get(y) or {}
+            e2_val = to_number(e2_s.get("value"))
+            e2_u = (e2_s.get("unit") or "").lower()
+            if tot_e and e2_val and e2_val > 0:
+                calc_rev = tot_e / e2_val if ("gj" in e2_u or e2_val < 500) else (tot_e * 1000.0) / e2_val
+                if 500 <= calc_rev <= 5000000:
+                    p["revenue_crore"] = round(calc_rev, 2)
+
+            if p.get("revenue_crore") is None:
+                wc_v, _ = p.get("water_consumption", (None, None))
+                e6_s = (merged.get("E6") or {}).get(y) or {}
+                e6_val = to_number(e6_s.get("value"))
+                if wc_v and e6_val and e6_val > 0:
+                    calc_rev = wc_v / e6_val
+                    if 500 <= calc_rev <= 5000000:
+                        p["revenue_crore"] = round(calc_rev, 2)
+
+            if p.get("revenue_crore") is not None:
+                f1_dict = merged.setdefault("F1", {})
+                if y not in f1_dict or not f1_dict[y].get("value"):
+                    f1_dict[y] = {
+                        "fy": y,
+                        "value": p["revenue_crore"],
+                        "unit": "Rs. crore",
+                        "components": {"revenue": p["revenue_crore"], "turnover": p["revenue_crore"]},
+                        "status": "derived",
+                        "text": "Derived from physical consumption and reported intensity",
+                    }
+
     return pool
 
 
@@ -1262,6 +1409,12 @@ def normalize_kpis(merged: dict, company_name: str = "Unknown", reporting_bounda
                     slot["inputs"]["women_kmp"] = {"value": p["women_kmp"], "unit": "count"}
                 if "total_kmp" not in slot["inputs"] and "total_kmp" in p:
                     slot["inputs"]["total_kmp"] = {"value": p["total_kmp"], "unit": "count"}
+
+            elif kid == "S14":
+                if "rural" not in slot["components"] and "rural_wages_pct" in p:
+                    slot["components"]["rural"] = p["rural_wages_pct"]
+                if "semi_urban" not in slot["components"] and "semi_urban_wages_pct" in p:
+                    slot["components"]["semi_urban"] = p["semi_urban_wages_pct"]
 
             year_notes = []
             rev_denom = p.get("revenue_crore") or revenue.get(y)
@@ -1550,16 +1703,16 @@ def get_kpi_slot_for_fy(record: dict, target_fy: str, report: dict | None = None
 
 def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | str:
     """
-    Extracts strictly the numeric metric value for a KPI slot.
+    Extracts strictly the numeric metric value (or clean status/year) for a KPI slot.
     Returns int or float if a numeric value is present.
-    If no numeric metric value is found, returns 'Not Found'.
+    For qualitative targets / governance indicators, returns target year (e.g. 2039) or clean status (e.g. 'Yes', 'Reasonable').
+    If no metric value is found, returns 'Not Found'.
     """
     if not slot or not isinstance(slot, dict):
         return "Not Found"
 
     kid = (record.get("kpi_id") or "").strip().upper()
-    kpi_meta = KPI_BY_ID.get(kid, {})
-    unit_kind = kpi_meta.get("unit_kind")
+    comps = slot.get("components") or {}
 
     # 1. Direct numeric value in slot
     if slot.get("value") is not None:
@@ -1568,8 +1721,6 @@ def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | 
             if float(n).is_integer():
                 return int(n)
             return round(float(n), 4)
-
-    comps = slot.get("components") or {}
 
     # 2. Key KPI component resolution
     if kid == "S1":
@@ -1588,11 +1739,26 @@ def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | 
             tot = (e or 0) + (w or 0)
             return int(tot) if float(tot).is_integer() else tot
 
+    elif kid == "S5":
+        # Attrition / Turnover Rate
+        pe = to_number(comps.get("permanent_employees"))
+        if pe is not None:
+            return int(pe) if float(pe).is_integer() else round(float(pe), 4)
+        tot = to_number(comps.get("total")) or to_number(comps.get("turnover"))
+        if tot is not None:
+            return int(tot) if float(tot).is_integer() else round(float(tot), 4)
+
     elif kid == "S6":
         # Gender Diversity: female_pct
         fp = to_number(comps.get("female_pct"))
         if fp is not None:
             return int(fp) if float(fp).is_integer() else round(float(fp), 4)
+
+    elif kid == "S9":
+        # Training Coverage: employees %
+        et = to_number(comps.get("employees")) or to_number(comps.get("percentage"))
+        if et is not None:
+            return int(et) if float(et).is_integer() else round(float(et), 4)
 
     elif kid == "S10":
         # POSH Complaints: filed count (fallback resolved)
@@ -1621,6 +1787,29 @@ def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | 
         if bg is not None:
             return int(bg) if float(bg).is_integer() else round(float(bg), 4)
 
+    elif kid == "S13":
+        # CSR Allocation Efficiency
+        eff = to_number(comps.get("efficiency")) or to_number(slot.get("value"))
+        if eff is not None:
+            return int(eff) if float(eff).is_integer() else round(float(eff), 4)
+
+    elif kid == "S14":
+        # Rural & Semi-Urban Job Creation %
+        r = to_number(comps.get("rural"))
+        su = to_number(comps.get("semi_urban"))
+        if r is not None or su is not None:
+            tot = (r or 0) + (su or 0)
+            return int(tot) if float(tot).is_integer() else round(float(tot), 4)
+        v = to_number(comps.get("total_pct")) or to_number(comps.get("value"))
+        if v is not None:
+            return int(v) if float(v).is_integer() else round(float(v), 4)
+
+    elif kid == "S15":
+        # Investment in Aspirational Districts
+        sp = to_number(comps.get("spent")) or to_number(comps.get("amount"))
+        if sp is not None:
+            return int(sp) if float(sp).is_integer() else round(float(sp), 4)
+
     elif kid == "G3":
         # Independent Directors: count or pct
         c = to_number(comps.get("count"))
@@ -1630,26 +1819,60 @@ def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | 
         if pct is not None:
             return int(pct) if float(pct).is_integer() else round(float(pct), 4)
 
+    elif kid == "G4":
+        # Board Committees count
+        c = to_number(comps.get("count"))
+        if c is not None:
+            return int(c) if float(c).is_integer() else c
+        if isinstance(comps.get("committees"), list):
+            return len(comps["committees"])
+
+    elif kid == "G6":
+        # Board Attendance Rate %
+        att = to_number(comps.get("attendance_pct")) or to_number(comps.get("attendance"))
+        if att is not None:
+            return int(att) if float(att).is_integer() else round(float(att), 4)
+
     elif kid == "F1":
-        # Revenue
-        rev = to_number(comps.get("revenue"))
+        # Revenue / Turnover in Rs. crore
+        rev = (
+            to_number(comps.get("revenue"))
+            or to_number(comps.get("turnover"))
+            or to_number(comps.get("revenue_consolidated"))
+            or to_number(comps.get("revenue_standalone"))
+        )
         if rev is not None:
             return int(rev) if float(rev).is_integer() else round(float(rev), 4)
 
     elif kid == "F2":
-        # Green Capex
-        gc = to_number(comps.get("green_capex"))
-        if gc is not None:
-            return int(gc) if float(gc).is_integer() else round(float(gc), 4)
+        # Green Capex %
         gp = to_number(comps.get("green_pct"))
         if gp is not None:
             return int(gp) if float(gp).is_integer() else round(float(gp), 4)
+        gc = to_number(comps.get("green_capex"))
+        if gc is not None:
+            return int(gc) if float(gc).is_integer() else round(float(gc), 4)
 
-    # 3. Qualitative / Text KPIs have no numeric metric value
-    if unit_kind == "text":
-        return "Not Found"
+    # 3. Qualitative / Target Year KPIs
+    if kid == "E10":
+        ty = to_number(comps.get("target_year"))
+        if ty is not None:
+            return int(ty)
+        st = comps.get("status") or slot.get("text")
+        if st:
+            return str(st).strip()
 
-    # 4. Check any numeric component for non-text KPIs
+    elif kid in ("E11", "S16"):
+        st = comps.get("status") or comps.get("detail") or slot.get("text")
+        if st:
+            return str(st).strip()
+
+    elif kid in ("G5", "G7", "G8", "G9", "G10"):
+        st = comps.get("status") or slot.get("text")
+        if st:
+            return str(st).strip()
+
+    # 4. Check any numeric component
     for v in comps.values():
         n = to_number(v)
         if n is not None:
@@ -1666,6 +1889,10 @@ def extract_numeric_kpi_value(record: dict, slot: dict | None) -> float | int | 
                 if float(n).is_integer():
                     return int(n)
                 return round(float(n), 4)
+
+    # 6. Fallback string for qualitative status
+    if slot.get("text"):
+        return str(slot["text"]).strip()
 
     return "Not Found"
 

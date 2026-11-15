@@ -357,38 +357,51 @@ No preamble, no markdown fences.
      "pages": [<page numbers from the --- Page N --- markers>]
    }}
    - Use "components" for KPIs that list components (e.g. S10 filed/resolved/pending, F1 \
-revenue/ebitda/pat, S12 budgeted/spent, G3 count/pct, E10 status/target_year/scope).
-   - For F1: extract revenue from operations, EBITDA, and PAT. If both standalone and consolidated \
-are reported, put standalone in components.revenue_standalone, consolidated in components.revenue_consolidated, \
-and reporting boundary ('standalone' or 'consolidated') in components.boundary. Put the printed money unit in "unit".
+revenue/turnover/ebitda/pat, S12 budgeted/spent, G3 count/pct, E10 status/target_year/scope).
+   - For F1 (Turnover & Revenue): In Indian BRSR reports, look in Section A Item IV-24 ('Turnover and net worth') \
+or Principle 6 tables citing 'revenue from operations'. Extract Turnover in Rs. crore (put standalone in components.revenue_standalone, \
+consolidated in components.revenue_consolidated, reporting boundary in components.boundary, and primary turnover in 'value' and components.revenue). \
+If EBITDA and PAT are disclosed, extract them; if not, Turnover alone is sufficient!
    - For E1 (Renewable Energy Share): ALWAYS extract renewable_energy and total_energy (and non_renewable_energy if shown) \
 into "inputs" with their units (e.g. GJ or MWh). If raw numbers are present, calculate value = (renewable_energy / total_energy) * 100.
    - For E2 (Energy Intensity): ALWAYS extract raw total_energy consumption (e.g. in GJ) into "inputs" with its unit. \
-Do NOT copy an arbitrary pre-calculated intensity (e.g. 57,500) if raw energy is disclosed. If both raw total_energy (in GJ) \
-and turnover/revenue (in Rs. crore) are available in this text, calculate: value = (total_energy in GJ * 1000) / revenue in Rs. crore.
-   - For E3 (Emission Intensity): ALWAYS extract scope1 and scope2 into "inputs". If revenue is in this text, \
-calculate value = (scope1 + scope2) / revenue.
-   - For E5 (Air Emission Intensity): ALWAYS extract sox and nox into "inputs" (convert MT to kg if needed).
-   - For E6 (Water Intensity): ALWAYS extract total water_consumption (in kL) into "inputs".
+ALSO extract the reported energy intensity (e.g. 57.5 GJ/crore or 57,500 MJ/crore) into "value" and "unit". \
+If both raw total_energy (in GJ) and turnover/revenue (in Rs. crore) are available in this text, calculate: value = (total_energy in GJ * 1000) / revenue in Rs. crore.
+   - For E3 (Emission Intensity): Extract scope1 and scope2 into "inputs". ALSO extract reported GHG intensity (e.g. 0.11 tCO2e/crore) into "value" and "unit".
+   - For E5 (Air Emission Intensity): ALWAYS extract sox and nox mass (in MT or kg) into "inputs".
+   - For E6 (Water Intensity): ALWAYS extract total water_consumption (in kL) into "inputs". ALSO extract reported water intensity (e.g. 45.8 kL/crore) into "value" and "unit".
    - For E7 (Water Recycling %): ALWAYS extract water_recycled and water_consumption into "inputs", and calculate (water_recycled / water_consumption) * 100.
-   - For E8 (Waste Intensity): ALWAYS extract total_waste (in tonnes) into "inputs".
+   - For E8 (Waste Intensity): ALWAYS extract total_waste (in tonnes) into "inputs". ALSO extract reported waste intensity (e.g. 1.8 MT/crore) into "value" and "unit".
    - For E9 (Waste Recycling %): ALWAYS extract waste_recovered and total_waste into "inputs", and calculate (waste_recovered / total_waste) * 100.
+   - For E10 (Net Zero Target): In Principle 2 LI-2 or Principle 6 LI-2, extract target year (e.g. 2039) into components.target_year, status 'Yes' into components.status, and scope covered into components.scope.
+   - For E11 (International Targets): Extract commitments (e.g. RE100, AWS Platinum, UNGC, ISO 14040, SBTi) into components.status or components.detail.
    - For S1 (Headcount): ALWAYS extract components: employees and workers, and calculate value = employees + workers.
    - For S2 (Fatalities): ALWAYS extract components: employees and workers, and calculate value = employees + workers (preserve 0).
    - For S3 (LTIFR): ALWAYS extract injuries and hours_worked into "inputs", and calculate (injuries * 1,000,000) / hours_worked.
    - For S4 (Well-being %): ALWAYS extract wellbeing_spend and payroll into "inputs", and calculate (spend / payroll) * 100.
+   - For S5 (Attrition / Turnover Rate): In Section A Item IV-22 ('Turnover rate for permanent employees and workers'), extract permanent employees turnover % (e.g. 18.4% FY26, 18.9% FY25) into components.permanent_employees and into "value" with unit "%".
    - For S6 (Gender Diversity %): ALWAYS extract components: female_pct, male_pct, or inputs: female_count, male_count.
    - For S7 (Income Inequality): Extract highest_paid and median_remuneration, and calculate highest / median.
    - For S8 (Wage Ratio): Extract median_female_pay and median_male_pay, and calculate female / male.
-   - For S9 (Training %): Extract employees_trained and total_employees, and calculate (trained / total) * 100.
+   - For S9 (Training %): In Principle 3 EI-8 ('Details of training given to employees and workers'), extract employees trained % (e.g. 87.3% FY26, 78.9% FY25) into components.employees and into "value" with unit "%".
    - For S10 (POSH): Extract components: filed, resolved, pending.
    - For S11 (Complaints): Extract components: received, resolved, pending.
    - For S12 (CSR): Extract components: budgeted, spent.
    - For S13 (CSR Allocation Efficiency %): Extract spent and budgeted, and calculate (spent / budgeted) * 100.
+   - For S14 (Rural & Semi-Urban Job Creation): In Principle 8 EI-5 ('Job creation in smaller towns — Wages paid to persons employed in smaller towns as % of total wage cost'), extract rural % (e.g. 32.0%) into components.rural and semi-urban % (e.g. 7.3%) into components.semi_urban, and sum (39.3%) into "value" with unit "%".
+   - For S15 (Investment in Aspirational Districts): In Principle 8 LI-2 ('CSR projects in designated aspirational districts'), extract total amount spent in Rs. crore into components.spent and into "value" (e.g. 25.62).
+   - For S16 (Social Targets): Extract social commitments (e.g. living wage by 2026, gender balance) into components.status or text.
    - For G1 (Women Directors %): Extract women_directors and board_size, and calculate (women / board_size) * 100.
    - For G2 (Women KMP %): Extract women_kmp and total_kmp, and calculate (women / total_kmp) * 100.
-   - For G3 (Independent Directors): Extract components: count, pct, board_size.
-   - For F2 (Green Capex %): Extract green_capex and total_capex, and calculate (green_capex / total_capex) * 100.
+   - For G3 (Independent Directors): In Section B Item 9 or Section A IV-16, extract count of independent directors into components.count and into "value" (e.g. 3 or 5).
+   - For G4 (Board Committees): In Section B Item 9 & 10, extract count of board committees into components.count and into "value" (e.g. 3).
+   - For G5 (Dedicated ESG Committee): In Section B Item 9, extract 'Yes' (CSR-ESG Committee) into components.status and into "value".
+   - For G6 (Board Attendance): In Section C Principle 1 EI-1 or Section B, extract Board attendance % (e.g. 100%) into components.attendance_pct and into "value" with unit "%".
+   - For G7 (Sustainability Report): Extract 'Yes' (BRSR / SEBI framework) into components.status and into "value".
+   - For G8 (Assurance Status): In Section A IV-11 or Independent Assurance Statement at start, extract assurance type ('Reasonable' / 'Limited') into components.status and into "value".
+   - For G9 (Climate Risk Framework): Extract 'Yes' into components.status and into "value".
+   - For G10 (Green Bond Framework): In Principle 1 EI-9, extract 'No' or 'Yes' into components.status and into "value".
+   - For F2 (Green Capex %): In Principle 2 EI-1 ('Percentage of R&D and CAPEX investments in technologies to improve environmental and social impacts'), extract green capex % into components.green_pct and into "value" with unit "%".
    - For Yes/No KPIs (E10, G5, G7, G8, G9, G10) put "Yes"/"No" (or the assurance level for \
 G8) in components.status and names/frameworks/years/providers in components.detail or the \
 listed components.

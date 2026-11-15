@@ -304,15 +304,17 @@ def test_extract_numeric_kpi_value_and_edge_cases():
     assert extract_numeric_kpi_value({"kpi_id": "G3"}, {"components": {"count": 6, "pct": 50.0}}) == 6
     assert extract_numeric_kpi_value({"kpi_id": "F1"}, {"components": {"revenue": 60000, "ebitda": 14000, "pat": 10000}}) == 60000
 
-    # Text / Qualitative KPIs return 'Not Found'
-    assert extract_numeric_kpi_value({"kpi_id": "E10"}, {"components": {"status": "Yes", "target_year": "2040"}}) == "Not Found"
-    assert extract_numeric_kpi_value({"kpi_id": "E11"}, {"text": "Alliance for Water Stewardship"}) == "Not Found"
-    assert extract_numeric_kpi_value({"kpi_id": "G5"}, {"components": {"status": "Yes"}}) == "Not Found"
-    assert extract_numeric_kpi_value({"kpi_id": "G7"}, {"components": {"status": "Yes"}}) == "Not Found"
+    # Qualitative KPIs return target year or clean status string
+    assert extract_numeric_kpi_value({"kpi_id": "E10"}, {"components": {"status": "Yes", "target_year": "2040"}}) == 2040
+    assert extract_numeric_kpi_value({"kpi_id": "E11"}, {"text": "Alliance for Water Stewardship"}) == "Alliance for Water Stewardship"
+    assert extract_numeric_kpi_value({"kpi_id": "G5"}, {"components": {"status": "Yes"}}) == "Yes"
+    assert extract_numeric_kpi_value({"kpi_id": "G7"}, {"components": {"status": "Yes"}}) == "Yes"
 
     # Empty slots return 'Not Found'
     assert extract_numeric_kpi_value({"kpi_id": "E1"}, None) == "Not Found"
     assert extract_numeric_kpi_value({"kpi_id": "E1"}, {}) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "E10"}, None) == "Not Found"
+    assert extract_numeric_kpi_value({"kpi_id": "G5"}, {}) == "Not Found"
 
 
 def test_trailing_page_citations():
@@ -538,4 +540,251 @@ def test_cross_kpi_pooling_csr_allocation():
     # S13: (25.0 / 20.0) * 100 = 125.0%
     assert by_id["S13"]["current"]["value"] == pytest.approx(125.0)
     assert by_id["S13"]["status"] == "derived"
+
+
+def test_revenue_back_calculation_and_intensity_derivation():
+    """
+    Simulates the exact HUL BRSR report case:
+    - F1 revenue is missing.
+    - E2 has raw energy 3,651,354 GJ and reported intensity 57.5 GJ/crore.
+    - System back-calculates revenue = 3,651,354 / 57.5 = 63,493.12 cr.
+    - E3 raw scope 1+2 = 7054 tCO2e is divided by revenue = 0.1111 tCO2e / Rs. crore.
+    - E5 raw air emissions = 427,000 kg is divided by revenue = 6.725 kg / Rs. crore.
+    - E6 water consumption = 2,908,019 kL is divided by revenue = 45.8 kL / Rs. crore.
+    """
+    e1 = {
+        "kpi_id": "E1",
+        "current": {
+            "inputs": {
+                "renewable_energy": {"value": 3560000, "unit": "GJ"},
+                "total_energy": {"value": 3651354, "unit": "GJ"},
+            }
+        },
+    }
+    e2 = {
+        "kpi_id": "E2",
+        "current": {
+            "value": 57.5,
+            "unit": "GJ per Rs. crore of turnover",
+            "inputs": {"total_energy": {"value": 3651354, "unit": "GJ"}},
+        },
+    }
+    e3 = {
+        "kpi_id": "E3",
+        "current": {
+            "value": 7054,
+            "unit": "tCO2e",
+            "inputs": {"scope1": {"value": 7054, "unit": "tCO2e"}, "scope2": {"value": 0, "unit": "tCO2e"}},
+        },
+    }
+    e5 = {
+        "kpi_id": "E5",
+        "current": {
+            "inputs": {"sox": {"value": 135000, "unit": "kg"}, "nox": {"value": 292000, "unit": "kg"}},
+        },
+    }
+    e6 = {
+        "kpi_id": "E6",
+        "current": {
+            "value": 45.8,
+            "unit": "kL per Rs. crore",
+            "inputs": {"water_consumption": {"value": 2908019, "unit": "kL"}},
+        },
+    }
+    by_id, _ = run([e1, e2, e3, e5, e6])
+
+    # F1 is back-filled
+    f1 = by_id["F1"]
+    assert f1["current"]["value"] == pytest.approx(63493.12, rel=1e-3)
+    assert f1["status"] == "derived"
+
+    # E2 intensity: 3651354 * 1000 / 63493.12 = 57,507.9 MJ / Rs. crore (or scaled 57,500)
+    assert by_id["E2"]["current"]["value"] == pytest.approx(57500.0, rel=1e-2)
+    assert by_id["E2"]["current"]["unit"] == "MJ per Rs. crore"
+
+    # E3 emission intensity: 7054 / 63493.12 = 0.1111 tCO2e / Rs. crore
+    assert by_id["E3"]["current"]["value"] == pytest.approx(0.1111, rel=1e-2)
+    assert by_id["E3"]["current"]["unit"] == "tCO2e per Rs. crore"
+
+    # E5 air emission intensity: (135,000 + 292,000) / 63493.12 = 6.725 kg / Rs. crore
+    assert by_id["E5"]["current"]["value"] == pytest.approx(6.725, rel=1e-2)
+    assert by_id["E5"]["current"]["unit"] == "kg per Rs. crore"
+
+    # E6 water intensity: 2908019 / 63493.12 = 45.8 kL / Rs. crore
+    assert by_id["E6"]["current"]["value"] == pytest.approx(45.8, rel=1e-2)
+
+
+def test_extract_numeric_kpi_value_all_categories():
+    """Tests extract_numeric_kpi_value across numerical and qualitative KPIs."""
+    from kpis import extract_numeric_kpi_value
+
+    # E10: Net Zero target year
+    e10_rec = {"kpi_id": "E10"}
+    assert extract_numeric_kpi_value(e10_rec, {"components": {"status": "Yes", "target_year": 2039}}) == 2039
+    assert extract_numeric_kpi_value(e10_rec, {"components": {"status": "Yes"}}) == "Yes"
+
+    # E11: International Targets
+    e11_rec = {"kpi_id": "E11"}
+    assert extract_numeric_kpi_value(e11_rec, {"components": {"status": "RE100, UNGC"}}) == "RE100, UNGC"
+
+    # S5: Attrition rate
+    s5_rec = {"kpi_id": "S5"}
+    assert extract_numeric_kpi_value(s5_rec, {"components": {"permanent_employees": 18.4}}) == 18.4
+
+    # S9: Training coverage
+    s9_rec = {"kpi_id": "S9"}
+    assert extract_numeric_kpi_value(s9_rec, {"components": {"employees": 87.3}}) == 87.3
+
+    # S14: Rural & Semi-Urban Job Creation
+    s14_rec = {"kpi_id": "S14"}
+    assert extract_numeric_kpi_value(s14_rec, {"components": {"rural": 32.0, "semi_urban": 7.3}}) == 39.3
+
+    # S15: Aspirational Districts spend
+    s15_rec = {"kpi_id": "S15"}
+    assert extract_numeric_kpi_value(s15_rec, {"components": {"spent": 25.62}}) == 25.62
+
+    # G3: Independent Directors count
+    g3_rec = {"kpi_id": "G3"}
+    assert extract_numeric_kpi_value(g3_rec, {"components": {"count": 3, "pct": 33.3}}) == 3
+
+    # G4: Board Committees count
+    g4_rec = {"kpi_id": "G4"}
+    assert extract_numeric_kpi_value(g4_rec, {"components": {"count": 3}}) == 3
+    assert extract_numeric_kpi_value(g4_rec, {"components": {"committees": ["Audit", "CSR-ESG", "Management"]}}) == 3
+
+    # G5, G7, G8, G9, G10: Governance statuses
+    assert extract_numeric_kpi_value({"kpi_id": "G5"}, {"components": {"status": "Yes"}}) == "Yes"
+    assert extract_numeric_kpi_value({"kpi_id": "G6"}, {"components": {"attendance_pct": 100}}) == 100
+    assert extract_numeric_kpi_value({"kpi_id": "G7"}, {"components": {"status": "Yes"}}) == "Yes"
+    assert extract_numeric_kpi_value({"kpi_id": "G8"}, {"components": {"status": "Reasonable"}}) == "Reasonable"
+    assert extract_numeric_kpi_value({"kpi_id": "G9"}, {"components": {"status": "Yes"}}) == "Yes"
+    assert extract_numeric_kpi_value({"kpi_id": "G10"}, {"components": {"status": "No"}}) == "No"
+
+    # F1 & F2
+    assert extract_numeric_kpi_value({"kpi_id": "F1"}, {"components": {"turnover": 63493}}) == 63493
+    assert extract_numeric_kpi_value({"kpi_id": "F2"}, {"components": {"green_pct": 15.2}}) == 15.2
+
+
+def test_multi_year_frame_image2_format():
+    """Tests that company_multi_year_frame generates the exact clean row in Image 2."""
+    from kpis import company_multi_year_frame, consolidated_multi_year_frame
+
+    report = {
+        "name": "BRSR26 HUL",
+        "kpis": [
+            {
+                "kpi_id": "E2",
+                "kpi_name": "Energy Intensity",
+                "category": "Environment",
+                "required_unit": "MJ per Rs. crore of revenue",
+                "status": "derived",
+                "current": {"fy": "FY2026", "value": 57500, "unit": "MJ per Rs. crore", "pages": [28]},
+                "previous": {"fy": "FY2025", "value": 57700, "unit": "MJ per Rs. crore", "pages": [28]},
+                "years": {
+                    "FY2026": {"value": 57500, "unit": "MJ per Rs. crore", "pages": [28]},
+                    "FY2025": {"value": 57700, "unit": "MJ per Rs. crore", "pages": [28]},
+                },
+                "pages": [28],
+            }
+        ],
+    }
+    df = consolidated_multi_year_frame([report], years=["FY2024", "FY2025", "FY2026"])
+    row = df.iloc[0]
+    assert row["Company"] == "BRSR26 HUL"
+    assert row["S. No."] == "E2"
+    assert row["Unit"] == "MJ per Rs. crore"
+    assert row["Env./Social/Gov."] == "Environment"
+    assert row["KPI"] == "Energy Intensity"
+    assert row["FY2024"] == "Not Found"
+    assert row["FY2025"] == 57700
+    assert row["FY2026"] == 57500
+    assert row["Source Page(s)"] == "FY25 data page 28, FY26 data page 28"
+
+
+def test_full_hul_brsr_extraction_dataset():
+    """
+    Tests complete KPI coverage and formatting for Hindustan Unilever Limited (HUL) BRSR 2026,
+    verifying all 36 KPIs against disclosed report figures.
+    """
+    from kpis import company_multi_year_frame, extract_numeric_kpi_value
+
+    hul_raw_kpis = [
+        {"kpi_id": "F1", "current": {"fy": "FY2026", "value": 63493, "unit": "Rs. crore", "components": {"turnover": 63493, "boundary": "consolidated"}}, "previous": {"fy": "FY2025", "value": 59711, "unit": "Rs. crore", "components": {"turnover": 59711}}, "pages": [8, 28]},
+        {"kpi_id": "F2", "current": {"fy": "FY2026", "value": 15.2, "unit": "%", "components": {"green_pct": 15.2, "rd_pct": 13.1}}, "pages": [16]},
+        {"kpi_id": "E1", "current": {"fy": "FY2026", "inputs": {"renewable_energy": {"value": 3560085, "unit": "GJ"}, "total_energy": {"value": 3651354, "unit": "GJ"}}}, "previous": {"fy": "FY2025", "inputs": {"renewable_energy": {"value": 3341108, "unit": "GJ"}, "total_energy": {"value": 3445152, "unit": "GJ"}}}, "pages": [28]},
+        {"kpi_id": "E2", "current": {"fy": "FY2026", "value": 57.5, "unit": "GJ per Rs. crore of turnover"}, "previous": {"fy": "FY2025", "value": 57.7, "unit": "GJ per Rs. crore"}, "pages": [28]},
+        {"kpi_id": "E3", "current": {"fy": "FY2026", "value": 7054, "unit": "tCO2e", "inputs": {"scope1": {"value": 7054, "unit": "tCO2e"}, "scope2": {"value": 0, "unit": "tCO2e"}}}, "previous": {"fy": "FY2025", "value": 8944, "unit": "tCO2e", "inputs": {"scope1": {"value": 8944, "unit": "tCO2e"}, "scope2": {"value": 0, "unit": "tCO2e"}}}, "pages": [30]},
+        {"kpi_id": "E4", "current": {"fy": "FY2026", "value": 10535856, "unit": "tCO2e"}, "previous": {"fy": "FY2025", "value": 9962535, "unit": "tCO2e"}, "pages": [32]},
+        {"kpi_id": "E5", "current": {"fy": "FY2026", "inputs": {"sox": {"value": 135000, "unit": "kg"}, "nox": {"value": 292000, "unit": "kg"}}}, "pages": [30]},
+        {"kpi_id": "E6", "current": {"fy": "FY2026", "value": 45.8, "unit": "kL per Rs. crore"}, "previous": {"fy": "FY2025", "value": 46.8, "unit": "kL per Rs. crore"}, "pages": [29]},
+        {"kpi_id": "E7", "current": {"fy": "FY2026", "value": 100, "unit": "%"}, "pages": [29]},
+        {"kpi_id": "E8", "current": {"fy": "FY2026", "value": 1.8, "unit": "metric tonnes per Rs. crore"}, "previous": {"fy": "FY2025", "value": 1.5, "unit": "metric tonnes per Rs. crore"}, "pages": [31]},
+        {"kpi_id": "E9", "current": {"fy": "FY2026", "value": 99.26, "unit": "%"}, "previous": {"fy": "FY2025", "value": 99.45, "unit": "%"}, "pages": [31]},
+        {"kpi_id": "E10", "current": {"fy": "FY2026", "components": {"status": "Yes", "target_year": 2039, "scope": "Scope 1, 2, 3"}}, "pages": [17, 32]},
+        {"kpi_id": "E11", "current": {"fy": "FY2026", "components": {"status": "AWS Platinum, RE100, UNGC"}}, "pages": [1, 10, 30]},
+        {"kpi_id": "S1", "current": {"fy": "FY2026", "components": {"employees": 7434, "workers": 17555}}, "pages": [26, 141]},
+        {"kpi_id": "S2", "current": {"fy": "FY2026", "components": {"employees": 0, "workers": 1}}, "previous": {"fy": "FY2025", "components": {"employees": 0, "workers": 0}}, "pages": [169]},
+        {"kpi_id": "S3", "current": {"fy": "FY2026", "value": 0.06, "unit": "per million hours worked"}, "previous": {"fy": "FY2025", "value": 0.23, "unit": "per million hours worked"}, "pages": [169]},
+        {"kpi_id": "S4", "current": {"fy": "FY2026", "value": 0.2, "unit": "%"}, "pages": [166]},
+        {"kpi_id": "S5", "current": {"fy": "FY2026", "components": {"permanent_employees": 18.4, "permanent_workers": 4.8}}, "previous": {"fy": "FY2025", "components": {"permanent_employees": 18.9, "permanent_workers": 5.1}}, "pages": [8]},
+        {"kpi_id": "S6", "current": {"fy": "FY2026", "components": {"female_pct": 31.36, "male_pct": 68.64}}, "pages": [26]},
+        {"kpi_id": "S7", "current": {"fy": "FY2026", "value": 49.65, "unit": "ratio"}, "pages": [26]},
+        {"kpi_id": "S8", "current": {"fy": "FY2026", "value": 1.0021, "unit": "ratio"}, "pages": [26]},
+        {"kpi_id": "S9", "current": {"fy": "FY2026", "components": {"employees": 87.3, "workers": 91.7}}, "previous": {"fy": "FY2025", "components": {"employees": 78.9, "workers": 85.2}}, "pages": [21]},
+        {"kpi_id": "S10", "current": {"fy": "FY2026", "components": {"filed": 11, "resolved": 11, "pending": 0}}, "previous": {"fy": "FY2025", "components": {"filed": 7, "resolved": 7}}, "pages": [26]},
+        {"kpi_id": "S11", "current": {"fy": "FY2026", "components": {"received": 2, "resolved": 2, "pending": 0}}, "previous": {"fy": "FY2025", "components": {"received": 4, "resolved": 4}}, "pages": [38]},
+        {"kpi_id": "S12", "current": {"fy": "FY2026", "components": {"spent": 25.62, "budgeted": 25.62}, "unit": "Rs. crore"}, "pages": [36]},
+        {"kpi_id": "S13", "current": {"fy": "FY2026", "value": 100.0, "unit": "%"}, "pages": [36]},
+        {"kpi_id": "S14", "current": {"fy": "FY2026", "components": {"rural": 32.0, "semi_urban": 7.3}}, "pages": [36]},
+        {"kpi_id": "S15", "current": {"fy": "FY2026", "components": {"spent": 25.62}, "unit": "Rs. crore"}, "pages": [36]},
+        {"kpi_id": "S16", "current": {"fy": "FY2026", "components": {"status": "Living wage by 2026"}}, "pages": [7, 10]},
+        {"kpi_id": "G1", "current": {"fy": "FY2026", "value": 33.33, "unit": "%"}, "pages": [26, 142]},
+        {"kpi_id": "G2", "current": {"fy": "FY2026", "value": 66.67, "unit": "%"}, "pages": [26, 142]},
+        {"kpi_id": "G3", "current": {"fy": "FY2026", "components": {"count": 3, "pct": 33.3}}, "pages": [13]},
+        {"kpi_id": "G4", "current": {"fy": "FY2026", "components": {"count": 3, "committees": ["Audit", "CSR-ESG", "Management"]}}, "pages": [13]},
+        {"kpi_id": "G5", "current": {"fy": "FY2026", "components": {"status": "Yes", "detail": "CSR-ESG Committee"}}, "pages": [13]},
+        {"kpi_id": "G6", "current": {"fy": "FY2026", "components": {"attendance_pct": 100}}, "pages": [14]},
+        {"kpi_id": "G7", "current": {"fy": "FY2026", "components": {"status": "Yes", "detail": "BRSR / SEBI"}}, "pages": [1, 13]},
+        {"kpi_id": "G8", "current": {"fy": "FY2026", "components": {"status": "Reasonable", "detail": "B S R & Co. LLP"}}, "pages": [3, 4]},
+        {"kpi_id": "G9", "current": {"fy": "FY2026", "components": {"status": "Yes", "detail": "GHG Protocol"}}, "pages": [9, 30]},
+        {"kpi_id": "G10", "current": {"fy": "FY2026", "components": {"status": "No"}}, "pages": [15]},
+    ]
+    by_id, normalized_list = run(hul_raw_kpis)
+    assert len(normalized_list) == 39
+
+    # Verify no 'Not Found' for disclosed FY26 metrics
+    rep = {"name": "BRSR26 HUL", "kpis": normalized_list}
+    df = company_multi_year_frame(rep, years=["FY2024", "FY2025", "FY2026"])
+    assert len(df) == 39
+
+    fy26_col = df["FY2026"].tolist()
+    # All 36 KPIs should have real values for FY26 (none 'Not Found')
+    assert "Not Found" not in fy26_col
+
+    # Check key indicators
+    e2_row = df[df["S. No."] == "E2"].iloc[0]
+    assert e2_row["FY2026"] == pytest.approx(57500, rel=1e-2)
+    assert e2_row["FY2025"] == pytest.approx(57700, rel=1e-2)
+
+    e3_row = df[df["S. No."] == "E3"].iloc[0]
+    assert e3_row["FY2026"] == pytest.approx(0.1111, rel=1e-2)
+
+    s5_row = df[df["S. No."] == "S5"].iloc[0]
+    assert s5_row["FY2026"] == 18.4
+    assert s5_row["FY2025"] == 18.9
+
+    s9_row = df[df["S. No."] == "S9"].iloc[0]
+    assert s9_row["FY2026"] == 87.3
+    assert s9_row["FY2025"] == 78.9
+
+    s14_row = df[df["S. No."] == "S14"].iloc[0]
+    assert s14_row["FY2026"] == 39.3
+
+    e10_row = df[df["S. No."] == "E10"].iloc[0]
+    assert e10_row["FY2026"] == 2039
+
+    g5_row = df[df["S. No."] == "G5"].iloc[0]
+    assert g5_row["FY2026"] == "Yes"
+
+
 

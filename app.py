@@ -359,11 +359,11 @@ def _report_status(report: dict) -> str:
 
 def _kpi_cell(record: dict | None, year: str = "current") -> str:
     if not record or not is_disclosed(record):
-        return "—"
+        return "Not Found"
     slot = record.get(year) or {}
     text = format_year(slot)
     if not text:
-        return "—"
+        return "Not Found"
     fy = slot.get("fy")
     year_status = record.get("year_status", {}).get(year)
     flag = " *" if year_status == "derived" else ""
