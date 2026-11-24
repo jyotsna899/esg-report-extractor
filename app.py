@@ -65,6 +65,7 @@ from kpis import (
     yoy_change,
 )
 from pipeline import extract_one_pdf
+from esg_v2.export import to_csv_bytes as template_csv_bytes, to_xlsx_bytes as template_xlsx_bytes
 from runtime import apply_streamlit_secrets, is_streamlit_cloud
 from store import (
     clear_all_reports,
@@ -693,6 +694,26 @@ def render_results_overview(reports: list[dict]):
         )
 
     ready = [report for report in reports if report_ready(report)]
+    if ready:
+        st.markdown("**Template export** — one row per company × FY × KPI, with source pages, "
+                    "formula/inputs and review flags (columns set in `config/output_columns.csv`).")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.download_button(
+                "📥 KPI Template (.xlsx, incl. Needs Review + Raw Datapoints)",
+                template_xlsx_bytes(ready),
+                file_name="ESG_KPI_Template_Output.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_template_xlsx",
+            )
+        with t2:
+            st.download_button(
+                "📥 KPI Template (.csv)",
+                template_csv_bytes(ready),
+                file_name="ESG_KPI_Template_Output.csv",
+                mime="text/csv",
+                key="dl_template_csv",
+            )
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if ready:

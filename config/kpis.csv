@@ -1,0 +1,42 @@
+kpi_id,name,category,type,output_unit,formula,components,direction
+REVENUE,Revenue used as intensity denominator,Financial,Helper,Rs. crore,turnover_brsr || revenue_ops_standalone || revenue_ops_consolidated,,
+HEADCOUNT,Employees + workers,Social,Helper,number,employees_total + workers_total || employees_total,,
+E1,Renewable Energy Share,Environment,Derived,%,renewable_energy / total_energy * 100 || renewable_energy / (renewable_energy + non_renewable_energy) * 100,renewable_GJ=renewable_energy;total_GJ=total_energy,higher
+E2,Energy Intensity,Environment,Derived,MJ per Rs. crore,total_energy * 1000 / REVENUE,total_energy_GJ=total_energy;revenue_cr=REVENUE,lower
+E3,Scope 1 & 2 Emission Intensity,Environment,Derived,tCO2e per Rs. crore,(scope1 + scope2) / REVENUE,scope1_t=scope1;scope2_t=scope2;revenue_cr=REVENUE,lower
+E4,Scope 3 Emissions,Environment,Direct,tCO2e,scope3,,lower
+E5,Air Emission Intensity (SOx + NOx),Environment,Derived,kg per Rs. crore,(sox + nox) / REVENUE,sox_kg=sox;nox_kg=nox;revenue_cr=REVENUE,lower
+E6,Water Consumption Intensity,Environment,Derived,kL per Rs. crore,water_consumption / REVENUE,water_kl=water_consumption;revenue_cr=REVENUE,lower
+E7,Water Recycling Rate,Environment,Derived,%,water_recycled / water_consumption * 100,recycled_kl=water_recycled;consumption_kl=water_consumption,higher
+E8,Waste Generation Intensity,Environment,Derived,tonnes per Rs. crore,total_waste / REVENUE,waste_t=total_waste;revenue_cr=REVENUE,lower
+E9,Waste Recycling Rate,Environment,Derived,%,waste_recovered / total_waste * 100,recovered_t=waste_recovered;total_t=total_waste,higher
+E10,Net Zero Target Status,Environment,Direct,text,net_zero,,
+E11,International Targets / Commitments,Environment,Direct,text,international_commitments,,
+S1,Total Workforce Headcount,Social,Derived,number,HEADCOUNT,employees=employees_total;workers=workers_total,
+S2,Workplace Fatalities,Social,Derived,number,fatalities_employees + fatalities_workers || fatalities_employees,employees=fatalities_employees;workers=fatalities_workers,lower
+S3,LTIFR (employees),Social,Direct,per million person-hours,ltifr_employees,employees=ltifr_employees;workers=ltifr_workers,lower
+S4,Employee Well-being Investment,Social,Direct,% of revenue,wellbeing_pct_revenue,,higher
+S5,Attrition Rate (permanent employees),Social,Direct,%,attrition_employees_pct,permanent_employees=attrition_employees_pct;permanent_workers=attrition_workers_pct,lower
+S6,Gender Diversity (% female),Social,Derived,%,(female_employees + female_workers) / HEADCOUNT * 100 || female_employees / employees_total * 100,female=female_employees;female_workers=female_workers;male=male_employees;male_workers=male_workers,
+S7,Income Inequality Ratio,Social,Direct,x (highest / median),highest_to_median_ratio,,lower
+S8,Female to Male Wage Ratio,Social,Derived,ratio,median_female_pay / median_male_pay,female_median=median_female_pay;male_median=median_male_pay,higher
+S9,Training Coverage (employees),Social,Direct,%,training_employees_pct,,higher
+S10,POSH Complaints filed,Social,Direct,number,posh_filed,filed=posh_filed;pending=posh_pending;resolved=posh_filed - posh_pending,
+S11,Consumer Complaints received,Social,Direct,number,consumer_complaints_received,received=consumer_complaints_received;pending=consumer_complaints_pending;resolved=consumer_complaints_received - consumer_complaints_pending,
+S12,CSR Spent,Social,Direct,Rs. crore,csr_spent,budgeted=csr_obligation;spent=csr_spent,
+S13,CSR Allocation Efficiency,Social,Derived,%,csr_spent / csr_obligation * 100,spent_cr=csr_spent;budgeted_cr=csr_obligation,higher
+S14,Rural & Semi-Urban Job Creation,Social,Derived,% of wage cost,rural_wages_pct + semi_urban_wages_pct,rural=rural_wages_pct;semi_urban=semi_urban_wages_pct,higher
+S15,Investment in Aspirational Districts,Social,Direct,Rs. crore,aspirational_spent,,higher
+S16,Social Targets & Commitments,Social,Direct,text,social_targets,,
+G1,Board Gender Diversity,Governance,Derived,%,women_directors / board_size * 100,women=women_directors;board=board_size,higher
+G2,KMP Gender Diversity,Governance,Derived,%,women_kmp / total_kmp * 100,women=women_kmp;total=total_kmp,higher
+G3,Independent Directors,Governance,Direct,number,independent_directors,count=independent_directors;pct_of_board=independent_directors / board_size * 100,higher
+G4,Board Committees,Governance,Direct,number,board_committees_count,committees=board_committees_names,
+G5,Dedicated ESG Committee,Governance,Direct,text,esg_committee,,
+G6,Board Attendance Rate,Governance,Direct,%,board_attendance_pct,,higher
+G7,Sustainability Report Released,Governance,Direct,text,sustainability_report,,
+G8,Assurance Status,Governance,Direct,text,assurance_type,,
+G9,Climate Risk Framework,Governance,Direct,text,climate_risk_framework,,
+G10,Green Bond Framework,Governance,Direct,text,green_bond,,
+F1,Revenue (BRSR turnover),Financial,Direct,Rs. crore,REVENUE,revenue_standalone=revenue_ops_standalone;revenue_consolidated=revenue_ops_consolidated;ebitda=ebitda;pat=pat,
+F2,Green Capex (% of capex),Financial,Direct,%,green_capex_pct,total_capex_cr=total_capex,higher
