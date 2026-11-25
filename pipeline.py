@@ -1,8 +1,32 @@
+"""
+Entry point used by the Streamlit app and the background job.
+
+ESG_ENGINE=v2 (default): accuracy-first core in esg_v2/ — section-wise page
+selection, native-PDF extraction of raw datapoints, Python-side units,
+grounding checks and formulas from config/kpis.csv.
+ESG_ENGINE=legacy: the previous single-prompt extractor (extractor.py).
+"""
+
 import gc
-from extractor import extract_kpis, extract_text_from_pdf
+import os
 
 
-def extract_one_pdf(path, company_name, on_status):
+def _engine() -> str:
+    return os.environ.get("ESG_ENGINE", "v2").strip().lower()
+
+
+def _extract_v2(path, company_name, on_status):
+    import extractor  # noqa: F401  (importing it loads GEMINI_API_KEY from .env)
+    from esg_v2.engine import extract_report
+
+    report = extract_report(path, company_name, on_status=on_status)
+    gc.collect()
+    return report
+
+
+def _extract_legacy(path, company_name, on_status):
+    from extractor import extract_kpis, extract_text_from_pdf
+
     def page_cb(current, total):
         fraction = current / max(total, 1)
         on_status(0.45 * fraction, f"Reading {current}/{total}")
@@ -31,3 +55,9 @@ def extract_one_pdf(path, company_name, on_status):
         "summary": "",
         "debug_log": debug_log,
     }
+
+
+def extract_one_pdf(path, company_name, on_status):
+    if _engine() == "legacy":
+        return _extract_legacy(path, company_name, on_status)
+    return _extract_v2(path, company_name, on_status)

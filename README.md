@@ -1,5 +1,61 @@
 # AI-Powered ESG Report Extractor
 
+## v2 extraction engine (default)
+
+The original single-prompt extractor read flattened PDF text, so BRSR tables
+(Male/Female/Total × FY columns) lost their structure and values came from the
+wrong row or year. v2 rebuilds the core around accuracy:
+
+| Step | What happens | Where |
+|---|---|---|
+| 1. Find pages | Keyword + heading scoring picks ~10–16 relevant pages per section group (general, governance, employees, environment, community, financial) | `esg_v2/page_finder.py` |
+| 2. Extract raw datapoints | Those pages are sent to Gemini **as a PDF** (tables keep their layout), one call per group, with a strict JSON schema. The model only copies figures + units exactly as printed — no maths | `esg_v2/llm.py` |
+| 3. Units | Rs./lakh/crore/million, GJ/MWh/TJ, kL/ML, kg/MT, … converted in Python | `esg_v2/units.py` |
+| 4. Verify | Every number must appear in the page text (page auto-corrected if found on another page); sanity rules (0–100 %, parts ≤ totals, renewable + non-renewable = total, 10× YoY jumps, computed vs company-reported intensity) | `esg_v2/validate.py`, `esg_v2/engine.py` |
+| 5. KPIs | The 39 KPIs computed in Python from `config/kpis.csv` | `esg_v2/formulas.py` |
+| 6. Export | Long format: Company · FY · KPI · Value · Unit · Type · Source page(s) · Formula/inputs · Quote · Status · Review flags | `esg_v2/export.py` |
+
+### Edit without touching code (`config/`)
+
+- `datapoints.csv` — the ~66 raw figures to extract: BRSR reference, extraction instruction, page-finder keywords.
+- `kpis.csv` — the 39 KPIs: type (Direct/Derived), output unit, **formula** over datapoint ids
+  (e.g. `renewable_energy / total_energy * 100`). Alternatives with `||` — the first whose inputs exist is used.
+  `Helper` rows (e.g. `REVENUE`) are reusable building blocks, not exported.
+- `output_columns.csv` — the export template: rename, reorder or delete rows to change the columns.
+
+### Run
+
+```bash
+pip install -r requirements.txt
+echo 'GEMINI_API_KEY=your-key' > .env          # optional: GEMINI_MODEL=gemini-3.5-flash (default)
+
+streamlit run app.py                           # UI — use "KPI Template" downloads
+python -m esg_v2.cli report.pdf --company "Acme" --out out/acme.xlsx
+python -m esg_v2.cli reports_folder/ --out out/all.xlsx   # bulk, resumes from out/cache/
+```
+
+The .xlsx has three sheets: **KPI Output** (template), **Needs Review** (only rows with flags)
+and **Raw Datapoints** (every printed figure, unit, page and quote — the audit trail).
+
+Settings: `ESG_ENGINE=legacy` switches back to the old extractor; `ESG_PARALLEL=3` sets
+concurrent section calls (lower it if you hit rate limits).
+
+### Measure accuracy
+
+Fill `eval/answer_key_template.csv` for 3–5 companies by hand, then:
+
+```bash
+python eval/evaluate.py eval/answer_key.csv out/all.xlsx
+```
+
+It prints overall and per-KPI accuracy (worst first) and every mismatch with its page.
+Fix the worst KPIs by refining that datapoint's `instruction` / `keywords` in `config/datapoints.csv`.
+
+---
+
+## Original documentation (legacy engine)
+
+
 Extracts a fixed set of 39 ESG and financial KPIs from company
 sustainability / BRSR reports (PDF), capturing both the current and the
 previous financial year when the report shows them side by side.

@@ -1,0 +1,14 @@
+column_header,field
+Company,company
+Financial Year,fy
+KPI ID,kpi_id
+KPI,kpi_name
+Category,category
+Value,value
+Unit,unit
+Type,type
+Source Page(s),pages
+Formula / Inputs,derivation
+Source Quote,quote
+Status,status
+Review Flags,flags
