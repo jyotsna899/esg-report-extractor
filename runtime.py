@@ -10,9 +10,12 @@ def apply_streamlit_secrets():
         import streamlit as st
     except ImportError:
         return
-    try:
-        key = st.secrets.get("GEMINI_API_KEY")
-    except Exception:
-        return
-    if key:
-        os.environ["GEMINI_API_KEY"] = str(key)
+    # Settings that may be set in Streamlit Cloud > App settings > Secrets.
+    # Copied to environment variables so the background job sees them too.
+    for name in ("GEMINI_API_KEY", "GEMINI_MODEL", "ESG_ENGINE", "ESG_PARALLEL"):
+        try:
+            value = st.secrets.get(name)
+        except Exception:
+            return
+        if value:
+            os.environ[name] = str(value)
